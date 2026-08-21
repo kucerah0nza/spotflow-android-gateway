@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Spotflow Gateway</string>
+    <string name="ingest_key_hint">Spotflow ingest key</string>
+    <string name="start">Start gateway</string>
+    <string name="stop">Stop gateway</string>
+    <string name="idle">Idle. Enter an ingest key and start the gateway.</string>
+</resources>

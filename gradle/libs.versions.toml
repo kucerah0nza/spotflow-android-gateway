@@ -1,0 +1,28 @@
+[versions]
+agp = "8.7.3"
+kotlin = "2.1.0"
+coroutines = "1.9.0"
+coreKtx = "1.13.1"
+appcompat = "1.7.0"
+material = "1.12.0"
+lifecycle = "2.8.7"
+hivemqMqtt = "1.3.3"
+junit = "4.13.2"
+mockk = "1.13.13"
+
+[libraries]
+kotlinx-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "coroutines" }
+kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
+androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
+material = { group = "com.google.android.material", name = "material", version.ref = "material" }
+hivemq-mqtt-client = { group = "com.hivemq", name = "hivemq-mqtt-client", version.ref = "hivemqMqtt" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+mockk = { group = "io.mockk", name = "mockk", version.ref = "mockk" }
+
+[plugins]
+android-library = { id = "com.android.library", version.ref = "agp" }
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
