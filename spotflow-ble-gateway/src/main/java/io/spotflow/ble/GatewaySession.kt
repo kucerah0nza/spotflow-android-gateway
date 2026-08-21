@@ -7,6 +7,7 @@ import io.spotflow.ble.protocol.MessageType
 import io.spotflow.ble.transport.BleConnection
 import io.spotflow.ble.transport.ConnectionState
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 /** Observable state of one device being gatewayed, surfaced to the host app / demo UI. */
@@ -38,6 +39,7 @@ internal class GatewaySession(
             onStatus(status)
         }
 
+        // Mirror BLE state to the UI for the whole session (CONNECTING / PREPARING / READY / ...).
         val stateJob = launch {
             connection.state.collect { bleState -> push { it.copy(ble = bleState) } }
         }
@@ -55,7 +57,8 @@ internal class GatewaySession(
 
         runCatching { uplink.publishSessionMetadata(connection.readSessionMetadata()) }
 
-        try {
+        // Relay TX Stream -> MQTT as a child job.
+        val pump = launch {
             connection.incoming.collect { message ->
                 when (message.type) {
                     MessageType.TELEMETRY -> uplink.publishTelemetry(message.payload)
@@ -64,8 +67,16 @@ internal class GatewaySession(
                 }
                 push { it.copy(forwarded = it.forwarded + 1) }
             }
+        }
+
+        try {
+            // Suspend until the link drops, then end the session so the caller (managed mode) tears
+            // this down and reconnects. Returning normally on a drop keeps the reconnect prompt; a
+            // failure during prepare/connect throws instead and is handled with backoff upstream.
+            connection.state.first { it == ConnectionState.DISCONNECTED || it == ConnectionState.FAILED }
         } finally {
             stateJob.cancel()
+            pump.cancel()
             uplink.disconnect()
             connection.close()
             push { it.copy(cloudConnected = false) }
