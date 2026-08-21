@@ -3,6 +3,7 @@ package io.spotflow.gateway.demo
 import android.Manifest
 import android.os.Build
 import android.os.Bundle
+import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -12,9 +13,11 @@ import androidx.core.view.updatePadding
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import io.spotflow.ble.GatewayDeviceState
 import io.spotflow.ble.SpotflowGateway
 import io.spotflow.ble.cloud.StaticIngestKey
 import io.spotflow.ble.service.SpotflowGatewayService
+import io.spotflow.ble.transport.ConnectionState
 import io.spotflow.gateway.demo.databinding.ActivityMainBinding
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -33,7 +36,7 @@ class MainActivity : AppCompatActivity() {
             if (grants.values.all { it }) {
                 startGateway()
             } else {
-                Toast.makeText(this, "Permissions are required to run the gateway", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, R.string.permissions_required, Toast.LENGTH_LONG).show()
             }
         }
 
@@ -54,7 +57,7 @@ class MainActivity : AppCompatActivity() {
         binding.startButton.setOnClickListener {
             val key = binding.ingestKey.text?.toString()?.trim().orEmpty()
             if (key.isEmpty()) {
-                Toast.makeText(this, "Enter an ingest key first", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, R.string.enter_key_first, Toast.LENGTH_SHORT).show()
             } else {
                 requestPermissionsThenStart()
             }
@@ -88,13 +91,17 @@ class MainActivity : AppCompatActivity() {
 
         binding.startButton.isEnabled = false
         binding.stopButton.isEnabled = true
-        binding.status.text = "Scanning for Spotflow devices…"
+        binding.ingestKeyLayout.isEnabled = false
+        binding.errorBanner.visibility = View.GONE
+        binding.status.text = getString(R.string.scanning)
     }
 
     private fun stopGateway() {
         SpotflowGatewayService.stop(this)
         binding.startButton.isEnabled = true
         binding.stopButton.isEnabled = false
+        binding.ingestKeyLayout.isEnabled = true
+        binding.errorBanner.visibility = View.GONE
         binding.status.text = getString(R.string.idle)
     }
 
@@ -107,19 +114,44 @@ class MainActivity : AppCompatActivity() {
                     gateway = SpotflowGatewayService.gateway
                     if (gateway == null) delay(300)
                 }
-                gateway.devices.collect { devices ->
-                    if (devices.isEmpty()) return@collect
-                    binding.status.text = devices.values.joinToString("\n\n") { d ->
-                        buildString {
-                            appendLine("device: ${d.deviceId ?: d.address}")
-                            appendLine("  ble:    ${d.ble}")
-                            appendLine("  cloud:  ${if (d.cloudConnected) "connected" else "offline"}")
-                            appendLine("  fwd:    ${d.forwarded} msgs")
-                            d.error?.let { appendLine("  error:  $it") }
-                        }
-                    }
-                }
+                gateway.devices.collect { devices -> render(devices.values.toList()) }
             }
+        }
+    }
+
+    private fun render(devices: List<GatewayDeviceState>) {
+        if (devices.isEmpty()) {
+            binding.status.text = getString(R.string.scanning)
+        } else {
+            binding.status.text = devices.joinToString("\n\n") { formatDevice(it) }
+        }
+
+        val error = devices.firstNotNullOfOrNull { it.error }
+        if (error == null) {
+            binding.errorBanner.visibility = View.GONE
+        } else {
+            val hint = if (error.contains("ingest key", ignoreCase = true)) {
+                "\n${getString(R.string.auth_hint)}"
+            } else {
+                ""
+            }
+            binding.errorBanner.text = "⚠  $error$hint"
+            binding.errorBanner.visibility = View.VISIBLE
+        }
+    }
+
+    private fun formatDevice(d: GatewayDeviceState): String {
+        val cloud = if (d.cloudConnected) "connected" else "offline"
+        val marker = when {
+            d.error != null -> "✗"
+            d.cloudConnected && d.ble == ConnectionState.READY -> "●"
+            else -> "…"
+        }
+        return buildString {
+            appendLine("$marker ${d.deviceId ?: d.address}")
+            appendLine("    ble:   ${d.ble}")
+            appendLine("    cloud: $cloud")
+            append("    fwd:   ${d.forwarded} msgs")
         }
     }
 }

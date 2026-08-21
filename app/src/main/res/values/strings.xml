@@ -1,7 +1,13 @@
 <resources>
     <string name="app_name">Spotflow Gateway</string>
-    <string name="ingest_key_hint">Spotflow ingest key</string>
-    <string name="start">Start gateway</string>
-    <string name="stop">Stop gateway</string>
-    <string name="idle">Idle. Enter an ingest key and start the gateway.</string>
+    <string name="subtitle">BLE → Spotflow cloud</string>
+    <string name="ingest_key_label">Ingest key</string>
+    <string name="ingest_key_hint">Paste ingest key</string>
+    <string name="start">Start</string>
+    <string name="stop">Stop</string>
+    <string name="idle">Enter your ingest key and tap Start to relay nearby Spotflow devices.</string>
+    <string name="scanning">Scanning for Spotflow devices…</string>
+    <string name="enter_key_first">Enter an ingest key first</string>
+    <string name="permissions_required">Bluetooth and notification permissions are required to run the gateway</string>
+    <string name="auth_hint">Tap Stop, re-enter the ingest key, and Start again.</string>
 </resources>
