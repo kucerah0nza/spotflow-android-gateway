@@ -30,6 +30,7 @@ import kotlinx.coroutines.launch
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
+    private val keyStore by lazy { IngestKeyStore(this) }
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
@@ -53,6 +54,9 @@ class MainActivity : AppCompatActivity() {
             view.updatePadding(top = bars.top, bottom = bars.bottom)
             insets
         }
+
+        // Prefill the previously saved ingest key.
+        binding.ingestKey.setText(keyStore.ingestKey)
 
         binding.startButton.setOnClickListener {
             val key = binding.ingestKey.text?.toString()?.trim().orEmpty()
@@ -85,6 +89,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun startGateway() {
         val key = binding.ingestKey.text?.toString()?.trim().orEmpty()
+        keyStore.ingestKey = key // persist across restarts
         SpotflowGatewayService.gatewayFactory = { ctx -> SpotflowGateway(ctx, StaticIngestKey(key)) }
         SpotflowGatewayService.onReady = { gateway -> gateway.startScanning() }
         SpotflowGatewayService.start(this)
