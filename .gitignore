@@ -9,3 +9,6 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Loose design source (the launcher asset lives in app/src/main/res)
+/spotflow-icon-black-512px.png
