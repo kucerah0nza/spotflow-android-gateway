@@ -16,6 +16,12 @@ class ManagedBleConnection(
     private val context: Context,
     private val device: BluetoothDevice,
     requestedMtu: Int = SpotflowGattSession.MAX_MTU,
+    /**
+     * `false` for a direct connect to an in-range device (fast, ideal for the first attempt after a
+     * scan). `true` lets Android re-attach automatically whenever the device reappears — the right
+     * choice for reconnecting to a known device that may currently be down.
+     */
+    private val autoConnect: Boolean = false,
 ) : BleConnection {
 
     private val session = SpotflowGattSession(requestedMtu)
@@ -27,7 +33,7 @@ class ManagedBleConnection(
 
     override suspend fun prepare() {
         session.connect { callback ->
-            device.connectGatt(context, /* autoConnect = */ false, callback, BluetoothDevice.TRANSPORT_LE)
+            device.connectGatt(context, autoConnect, callback, BluetoothDevice.TRANSPORT_LE)
         }
         session.prepare()
     }

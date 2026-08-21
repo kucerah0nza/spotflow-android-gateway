@@ -209,6 +209,10 @@ internal class SpotflowGattSession(
         attachGatt(open(callback))
         try {
             deferred.await()
+        } catch (t: Throwable) {
+            // On failure or cancellation, release the GATT so any pending autoConnect attempt stops.
+            disconnectAndClose()
+            throw t
         } finally {
             pendingConnect = null
         }

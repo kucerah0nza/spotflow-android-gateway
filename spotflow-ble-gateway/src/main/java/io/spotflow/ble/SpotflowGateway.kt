@@ -62,7 +62,9 @@ class SpotflowGateway(
         jobs[SCAN_JOB_KEY] = scope.launch {
             SpotflowScanner(adapter).scan().collect { device ->
                 if (!jobs.containsKey(device.address)) {
-                    launchManaged(device.address) { ManagedBleConnection(context, device, requestedMtu) }
+                    launchManaged(device.address) { autoConnect ->
+                        ManagedBleConnection(context, device, requestedMtu, autoConnect)
+                    }
                 }
             }
         }
@@ -72,11 +74,17 @@ class SpotflowGateway(
         jobs.remove(SCAN_JOB_KEY)?.cancel()
     }
 
-    private fun launchManaged(address: String, connectionFactory: () -> io.spotflow.ble.transport.BleConnection) {
+    private fun launchManaged(
+        address: String,
+        connectionFactory: (autoConnect: Boolean) -> io.spotflow.ble.transport.BleConnection,
+    ) {
         jobs[address] = scope.launch {
+            var firstAttempt = true
             var backoff = INITIAL_BACKOFF_MS
             while (isActive) {
-                val connection = connectionFactory()
+                // Direct connect on the first attempt (device is in range from the scan); use
+                // autoConnect for reconnects so Android re-attaches whenever the device reappears.
+                val connection = connectionFactory(!firstAttempt)
                 try {
                     GatewaySession(connection, credentials, mqttConfig, ::updateStatus).run()
                     backoff = INITIAL_BACKOFF_MS // clean end; reset backoff before reconnect
@@ -84,6 +92,7 @@ class SpotflowGateway(
                     Log.w(TAG, "session for $address failed: ${t.message}")
                     updateStatus(currentOf(address).copy(error = t.message, cloudConnected = false))
                 }
+                firstAttempt = false
                 if (!isActive) break
                 delay(backoff)
                 backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
