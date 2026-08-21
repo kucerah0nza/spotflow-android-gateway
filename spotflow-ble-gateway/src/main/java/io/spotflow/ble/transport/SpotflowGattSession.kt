@@ -13,10 +13,11 @@ import io.spotflow.ble.protocol.GattProfile
 import io.spotflow.ble.protocol.Message
 import io.spotflow.ble.protocol.MessageType
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -38,6 +39,7 @@ internal class SpotflowGattSession(
 ) {
     companion object {
         private const val TAG = "SpotflowGatt"
+        private const val LARGE_MESSAGE_BYTES = 4096
         const val MAX_MTU = 517
         private val CCCD_ENABLE_NOTIFICATION = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
     }
@@ -45,8 +47,10 @@ internal class SpotflowGattSession(
     private val _state = MutableStateFlow(ConnectionState.DISCONNECTED)
     val state: StateFlow<ConnectionState> = _state
 
-    private val _incoming = MutableSharedFlow<Message>(extraBufferCapacity = 64)
-    val incoming: SharedFlow<Message> = _incoming
+    // Unbounded so a burst of large coredump chunks is never dropped while MQTT publishing catches up.
+    // The buffer is drained by the single relay pump and is naturally bounded by the coredump size.
+    private val incomingChannel = Channel<Message>(Channel.UNLIMITED)
+    val incoming: Flow<Message> = incomingChannel.receiveAsFlow()
 
     @Volatile
     var mtu: Int = FrameCodec.MIN_MTU
@@ -170,9 +174,11 @@ internal class SpotflowGattSession(
     private fun onNotification(characteristic: BluetoothGattCharacteristic, value: ByteArray) {
         if (characteristic.uuid != GattProfile.TX_STREAM) return
         val message = reassembler.onFragment(value) ?: return
-        if (!_incoming.tryEmit(message)) {
-            Log.w(TAG, "dropped inbound ${message.type}: subscriber buffer full")
+        if (message.payload.size >= LARGE_MESSAGE_BYTES) {
+            // Large TELEMETRY messages are typically coredump chunks; log to aid diagnosis.
+            Log.d(TAG, "reassembled ${message.type} (${message.payload.size} bytes)")
         }
+        incomingChannel.trySend(message)
     }
 
     private fun completeRead(value: ByteArray, status: Int) {
@@ -338,6 +344,7 @@ internal class SpotflowGattSession(
         runCatching { g.close() }
         gatt = null
         reassembler.reset()
+        incomingChannel.close()
         _state.value = ConnectionState.DISCONNECTED
     }
 
@@ -345,6 +352,7 @@ internal class SpotflowGattSession(
     fun detach() {
         gatt = null
         reassembler.reset()
+        incomingChannel.close()
         _state.value = ConnectionState.DISCONNECTED
     }
 
