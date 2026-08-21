@@ -3,6 +3,8 @@ package io.spotflow.ble.cloud
 import android.util.Log
 import com.hivemq.client.mqtt.MqttClient
 import com.hivemq.client.mqtt.mqtt5.Mqtt5AsyncClient
+import com.hivemq.client.mqtt.mqtt5.exceptions.Mqtt5ConnAckException
+import com.hivemq.client.mqtt.mqtt5.message.connect.connack.Mqtt5ConnAckReasonCode
 import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5Publish
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.concurrent.CompletableFuture
@@ -47,19 +49,26 @@ class MqttUplink(
         return builder.buildAsync()
     }
 
-    /** Connects and subscribes to the desired-configuration topic. */
+    /**
+     * Connects and subscribes to the desired-configuration topic. Throws [MqttAuthException] if the
+     * broker rejects the credentials, or [MqttConnectException] for other connect failures.
+     */
     suspend fun connect() {
         val ingestKey = credentials.ingestKey(deviceId)
-        client.connectWith()
-            .simpleAuth()
-            .username(deviceId)
-            .password(ingestKey.toByteArray(Charsets.UTF_8))
-            .applySimpleAuth()
-            .keepAlive(config.keepAliveSeconds)
-            .cleanStart(false)
-            .sessionExpiryInterval(SESSION_EXPIRY_SECONDS)
-            .send()
-            .await()
+        try {
+            client.connectWith()
+                .simpleAuth()
+                .username(deviceId)
+                .password(ingestKey.toByteArray(Charsets.UTF_8))
+                .applySimpleAuth()
+                .keepAlive(config.keepAliveSeconds)
+                .cleanStart(false)
+                .sessionExpiryInterval(SESSION_EXPIRY_SECONDS)
+                .send()
+                .await()
+        } catch (t: Throwable) {
+            throw translateConnectError(t)
+        }
 
         client.subscribeWith()
             .topicFilter(config.topics.desiredConfiguration)
@@ -91,6 +100,32 @@ class MqttUplink(
 
     private fun onCloudMessage(publish: Mqtt5Publish) {
         desiredConfigurationHandler?.invoke(publish.payloadAsBytes)
+    }
+
+    /** Maps a HiveMQ connect failure to a clear, shareable exception carrying the broker's reason. */
+    private fun translateConnectError(error: Throwable): Exception {
+        val connAck = generateSequence(error) { it.cause }
+            .filterIsInstance<Mqtt5ConnAckException>()
+            .firstOrNull()
+            ?: return MqttConnectException(error.message ?: "MQTT connection failed", error)
+
+        val ack = connAck.mqttMessage
+        val reasonCode = ack.reasonCode
+        val reasonString = ack.reasonString.map { it.toString() }.orElse(null)
+        val detail = buildString {
+            append(reasonCode.name)
+            if (!reasonString.isNullOrBlank()) append(": ").append(reasonString)
+        }
+
+        return when (reasonCode) {
+            Mqtt5ConnAckReasonCode.BAD_USER_NAME_OR_PASSWORD,
+            Mqtt5ConnAckReasonCode.NOT_AUTHORIZED,
+            Mqtt5ConnAckReasonCode.BANNED,
+            ->
+                MqttAuthException("Broker rejected the ingest key ($detail)")
+            else ->
+                MqttConnectException("Broker refused the connection ($detail)", error)
+        }
     }
 
     companion object {

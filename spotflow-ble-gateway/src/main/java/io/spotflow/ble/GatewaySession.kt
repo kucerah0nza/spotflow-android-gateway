@@ -44,42 +44,49 @@ internal class GatewaySession(
             connection.state.collect { bleState -> push { it.copy(ble = bleState) } }
         }
 
-        connection.prepare()
-        val deviceId = connection.readDeviceId()
-        push { it.copy(deviceId = deviceId) }
-
-        val uplink = MqttUplink(deviceId, credentials, mqttConfig)
-        uplink.desiredConfigurationHandler = { payload ->
-            launch { runCatching { connection.sendDesiredConfiguration(payload) } }
-        }
-        uplink.connect()
-        push { it.copy(cloudConnected = true) }
-
-        runCatching { uplink.publishSessionMetadata(connection.readSessionMetadata()) }
-
-        // Relay TX Stream -> MQTT as a child job.
-        val pump = launch {
-            connection.incoming.collect { message ->
-                when (message.type) {
-                    MessageType.TELEMETRY -> uplink.publishTelemetry(message.payload)
-                    MessageType.REPORTED_CONFIGURATION -> uplink.publishReportedConfiguration(message.payload)
-                    else -> return@collect
-                }
-                push { it.copy(forwarded = it.forwarded + 1) }
-            }
-        }
-
+        // Outer finally guarantees the BLE connection is released no matter where we exit (including a
+        // failed MQTT connect); the inner finally guarantees the MQTT client is stopped once created.
         try {
-            // Suspend until the link drops, then end the session so the caller (managed mode) tears
-            // this down and reconnects. Returning normally on a drop keeps the reconnect prompt; a
-            // failure during prepare/connect throws instead and is handled with backoff upstream.
-            connection.state.first { it == ConnectionState.DISCONNECTED || it == ConnectionState.FAILED }
+            connection.prepare()
+            val deviceId = connection.readDeviceId()
+            push { it.copy(deviceId = deviceId) }
+
+            val uplink = MqttUplink(deviceId, credentials, mqttConfig)
+            try {
+                uplink.desiredConfigurationHandler = { payload ->
+                    launch { runCatching { connection.sendDesiredConfiguration(payload) } }
+                }
+                uplink.connect()
+                push { it.copy(cloudConnected = true, error = null) }
+
+                runCatching { uplink.publishSessionMetadata(connection.readSessionMetadata()) }
+
+                // Relay TX Stream -> MQTT as a child job.
+                val pump = launch {
+                    connection.incoming.collect { message ->
+                        when (message.type) {
+                            MessageType.TELEMETRY -> uplink.publishTelemetry(message.payload)
+                            MessageType.REPORTED_CONFIGURATION ->
+                                uplink.publishReportedConfiguration(message.payload)
+                            else -> return@collect
+                        }
+                        push { it.copy(forwarded = it.forwarded + 1) }
+                    }
+                }
+
+                try {
+                    // Suspend until the link drops, then return so the caller (managed mode) reconnects.
+                    connection.state.first { it == ConnectionState.DISCONNECTED || it == ConnectionState.FAILED }
+                } finally {
+                    pump.cancel()
+                }
+            } finally {
+                uplink.disconnect()
+                push { it.copy(cloudConnected = false) }
+            }
         } finally {
             stateJob.cancel()
-            pump.cancel()
-            uplink.disconnect()
             connection.close()
-            push { it.copy(cloudConnected = false) }
         }
     }
 }

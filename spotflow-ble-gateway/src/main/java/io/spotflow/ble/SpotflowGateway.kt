@@ -8,6 +8,7 @@ import android.content.Context
 import android.util.Log
 import androidx.annotation.RequiresPermission
 import io.spotflow.ble.cloud.CredentialsProvider
+import io.spotflow.ble.cloud.MqttAuthException
 import io.spotflow.ble.cloud.MqttConfig
 import io.spotflow.ble.transport.AttachedBleConnection
 import io.spotflow.ble.transport.ManagedBleConnection
@@ -88,6 +89,11 @@ class SpotflowGateway(
                 try {
                     GatewaySession(connection, credentials, mqttConfig, ::updateStatus).run()
                     backoff = INITIAL_BACKOFF_MS // clean end; reset backoff before reconnect
+                } catch (t: MqttAuthException) {
+                    // The ingest key won't change until the gateway is restarted; stop retrying.
+                    Log.w(TAG, "auth rejected for $address: ${t.message}")
+                    updateStatus(currentOf(address).copy(error = t.message, cloudConnected = false))
+                    break
                 } catch (t: Throwable) {
                     Log.w(TAG, "session for $address failed: ${t.message}")
                     updateStatus(currentOf(address).copy(error = t.message, cloudConnected = false))
