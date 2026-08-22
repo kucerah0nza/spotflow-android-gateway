@@ -168,6 +168,8 @@ class SpotflowGateway(
                 try {
                     GatewaySession(context, connection, credentials, mqttConfig, ::updateStatus).run()
                     backoff = INITIAL_BACKOFF_MS // clean end; reset backoff before reconnect
+                } catch (c: CancellationException) {
+                    throw c // normal teardown (Stop / Bluetooth off / detach) — not an error
                 } catch (t: MqttAuthException) {
                     // The ingest key won't change until the gateway is restarted; stop retrying.
                     Log.w(TAG, "auth rejected for $address: ${t.message}")
@@ -199,6 +201,8 @@ class SpotflowGateway(
         jobs[address] = scope.launch {
             try {
                 GatewaySession(context, connection, credentials, mqttConfig, ::updateStatus).run()
+            } catch (c: CancellationException) {
+                throw c // normal teardown — not an error
             } catch (t: Throwable) {
                 updateStatus(currentOf(address).copy(error = t.message, cloudConnected = false))
             }

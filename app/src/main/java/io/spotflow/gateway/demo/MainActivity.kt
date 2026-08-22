@@ -27,6 +27,7 @@ import io.spotflow.ble.cloud.StaticIngestKey
 import io.spotflow.ble.service.SpotflowGatewayService
 import io.spotflow.ble.transport.ConnectionState
 import io.spotflow.gateway.demo.databinding.ActivityMainBinding
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -205,13 +206,21 @@ class MainActivity : AppCompatActivity() {
     private fun observeDevices() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
-                // Wait for the service to create the gateway, then mirror its device flow.
-                var gateway: SpotflowGateway? = null
-                while (gateway == null) {
-                    gateway = SpotflowGatewayService.gateway
-                    if (gateway == null) delay(300)
+                // The service creates a fresh gateway on each Start, so track the current one and
+                // re-subscribe when it changes (otherwise the UI keeps mirroring a shut-down gateway).
+                var current: SpotflowGateway? = null
+                var collectJob: Job? = null
+                while (true) {
+                    val gateway = SpotflowGatewayService.gateway
+                    if (gateway !== current) {
+                        current = gateway
+                        collectJob?.cancel()
+                        collectJob = gateway?.let { g ->
+                            launch { g.devices.collect { render(it.values.toList()) } }
+                        }
+                    }
+                    delay(300)
                 }
-                gateway.devices.collect { devices -> render(devices.values.toList()) }
             }
         }
     }
