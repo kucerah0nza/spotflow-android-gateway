@@ -2,6 +2,7 @@ package io.spotflow.ble.transport
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import io.spotflow.ble.protocol.GattProfile
 import kotlinx.coroutines.flow.Flow
@@ -35,6 +36,10 @@ class ManagedBleConnection(
     // The host is responsible for holding BLUETOOTH_CONNECT (documented in the README/manifest).
     @SuppressLint("MissingPermission")
     override suspend fun prepare() {
+        // connectGatt while Bluetooth is off returns null / never connects; fail fast so the caller's
+        // retry loop backs off and reconnects once Bluetooth is back on.
+        val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+        check(adapter?.isEnabled == true) { "Bluetooth is off" }
         session.connect { callback ->
             device.connectGatt(context, autoConnect, callback, BluetoothDevice.TRANSPORT_LE)
         }

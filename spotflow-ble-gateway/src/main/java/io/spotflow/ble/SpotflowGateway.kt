@@ -2,15 +2,21 @@ package io.spotflow.ble
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothManager
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.util.Log
 import androidx.annotation.RequiresPermission
+import androidx.core.content.ContextCompat
 import io.spotflow.ble.cloud.CredentialsProvider
 import io.spotflow.ble.cloud.MqttAuthException
 import io.spotflow.ble.cloud.MqttConfig
 import io.spotflow.ble.transport.AttachedBleConnection
+import io.spotflow.ble.transport.ConnectionState
 import io.spotflow.ble.transport.ManagedBleConnection
 import io.spotflow.ble.transport.SpotflowGattSession
 import io.spotflow.ble.transport.SpotflowScanner
@@ -59,10 +65,63 @@ class SpotflowGateway(
     /** True if the device has Bluetooth and it is currently turned on. */
     val isBluetoothEnabled: Boolean get() = adapter?.isEnabled == true
 
+    private val appContext = context.applicationContext
+
+    @Volatile private var wantScanning = false
+    @Volatile private var receiverRegistered = false
+
+    /**
+     * Watches the Bluetooth adapter itself. Turning Bluetooth off often does not deliver a GATT
+     * disconnect callback, which would otherwise leave sessions parked forever; observing the adapter
+     * lets the gateway tear those sessions down and rediscover once Bluetooth returns — even with the
+     * screen off / app backgrounded, since the gateway runs in a foreground service.
+     */
+    private val bluetoothStateReceiver = object : BroadcastReceiver() {
+        @SuppressLint("MissingPermission")
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> handleBluetoothOff()
+                BluetoothAdapter.STATE_ON -> handleBluetoothOn()
+            }
+        }
+    }
+
+    private fun handleBluetoothOff() {
+        if (jobs.isEmpty()) return
+        Log.w(TAG, "Bluetooth off; tearing down ${jobs.size} job(s)")
+        jobs.values.forEach { it.cancel() }
+        jobs.clear()
+        _devices.update { devices ->
+            devices.mapValues { it.value.copy(ble = ConnectionState.DISCONNECTED, cloudConnected = false) }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handleBluetoothOn() {
+        if (wantScanning) {
+            Log.i(TAG, "Bluetooth on; resuming scanning")
+            startScanning()
+        }
+    }
+
+    private fun registerBluetoothReceiver() {
+        if (receiverRegistered) return
+        ContextCompat.registerReceiver(
+            appContext,
+            bluetoothStateReceiver,
+            IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        receiverRegistered = true
+    }
+
     // ---- managed mode ----------------------------------------------------------------------------
 
     @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT])
     fun startScanning() {
+        wantScanning = true
+        registerBluetoothReceiver()
         if (jobs.containsKey(SCAN_JOB_KEY)) return
         val bluetoothAdapter = adapter
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
@@ -91,6 +150,7 @@ class SpotflowGateway(
     }
 
     fun stopScanning() {
+        wantScanning = false
         jobs.remove(SCAN_JOB_KEY)?.cancel()
     }
 
@@ -154,6 +214,11 @@ class SpotflowGateway(
 
     /** Stops everything and releases resources. */
     fun shutdown() {
+        wantScanning = false
+        if (receiverRegistered) {
+            runCatching { appContext.unregisterReceiver(bluetoothStateReceiver) }
+            receiverRegistered = false
+        }
         jobs.values.forEach { it.cancel() }
         jobs.clear()
         scope.cancel()
