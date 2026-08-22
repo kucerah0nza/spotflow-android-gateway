@@ -95,9 +95,10 @@ class MainActivity : AppCompatActivity() {
             insets
         }
 
-        // Prefill the previously saved ingest key and buffer size.
+        // Prefill the previously saved ingest key and buffer sizes.
         binding.ingestKey.setText(keyStore.ingestKey)
-        binding.bufferMb.setText(keyStore.bufferMb.toString())
+        binding.bufferRamMb.setText(keyStore.bufferRamMb.toString())
+        binding.bufferFlashMb.setText(keyStore.bufferFlashMb.toString())
 
         binding.startButton.setOnClickListener {
             val key = binding.ingestKey.text?.toString()?.trim().orEmpty()
@@ -164,12 +165,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun startGateway() {
         val key = binding.ingestKey.text?.toString()?.trim().orEmpty()
-        val bufferMb = binding.bufferMb.text?.toString()?.toIntOrNull()?.coerceAtLeast(1)
-            ?: keyStore.bufferMb
+        val ramMb = binding.bufferRamMb.text?.toString()?.toIntOrNull()?.coerceAtLeast(1)
+            ?: keyStore.bufferRamMb
+        val flashMb = binding.bufferFlashMb.text?.toString()?.toIntOrNull()?.coerceAtLeast(1)
+            ?: keyStore.bufferFlashMb
         keyStore.ingestKey = key // persist across restarts
-        keyStore.bufferMb = bufferMb
+        keyStore.bufferRamMb = ramMb
+        keyStore.bufferFlashMb = flashMb
 
-        val config = MqttConfig(bufferMaxBytes = bufferMb.toLong() * 1024L * 1024L)
+        val config = MqttConfig(
+            bufferMaxBytes = (ramMb + flashMb).toLong() * 1024L * 1024L,
+            ramBufferMaxBytes = ramMb.toLong() * 1024L * 1024L,
+        )
         SpotflowGatewayService.gatewayFactory = { ctx -> SpotflowGateway(ctx, StaticIngestKey(key), config) }
         SpotflowGatewayService.onReady = { gateway -> gateway.startScanning() }
         SpotflowGatewayService.start(this)
@@ -177,7 +184,8 @@ class MainActivity : AppCompatActivity() {
         binding.startButton.isEnabled = false
         binding.stopButton.isEnabled = true
         binding.ingestKeyLayout.isEnabled = false
-        binding.bufferMb.isEnabled = false
+        binding.bufferRamMb.isEnabled = false
+        binding.bufferFlashMb.isEnabled = false
         binding.errorBanner.visibility = View.GONE
         binding.status.text = getString(R.string.scanning)
     }
@@ -187,7 +195,8 @@ class MainActivity : AppCompatActivity() {
         binding.startButton.isEnabled = true
         binding.stopButton.isEnabled = false
         binding.ingestKeyLayout.isEnabled = true
-        binding.bufferMb.isEnabled = true
+        binding.bufferRamMb.isEnabled = true
+        binding.bufferFlashMb.isEnabled = true
         binding.errorBanner.visibility = View.GONE
         binding.btBanner.visibility = View.GONE
         binding.status.text = getString(R.string.idle)
@@ -235,13 +244,14 @@ class MainActivity : AppCompatActivity() {
             d.cloudConnected && d.ble == ConnectionState.READY -> "●"
             else -> "…"
         }
+        fun line(label: String, value: String) = "    ${"$label:".padEnd(14)}$value"
         return buildString {
             appendLine("$marker ${d.deviceId ?: d.address}")
-            appendLine("    ble:   ${d.ble}")
-            appendLine("    cloud: $cloud")
-            appendLine("    fwd:   ${d.forwarded} msgs")
-            appendLine("    ram:   ${humanBytes(d.ramBytes)}")
-            append("    flash: ${humanBytes(d.diskBytes)}")
+            appendLine(line("ble", d.ble.toString()))
+            appendLine(line("cloud", cloud))
+            appendLine(line("fwd", "${d.forwarded} msgs"))
+            appendLine(line("buffer_ram", humanBytes(d.ramBytes)))
+            append(line("buffer_flash", humanBytes(d.diskBytes)))
         }
     }
 

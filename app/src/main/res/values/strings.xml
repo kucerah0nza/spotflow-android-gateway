@@ -3,7 +3,8 @@
     <string name="subtitle">BLE → Spotflow cloud</string>
     <string name="ingest_key_label">Ingest key</string>
     <string name="ingest_key_hint">Paste ingest key</string>
-    <string name="buffer_label">Buffer (MB)</string>
+    <string name="buffer_ram_label">buffer_ram (MB)</string>
+    <string name="buffer_flash_label">buffer_flash (MB)</string>
     <string name="start">Start</string>
     <string name="stop">Stop</string>
     <string name="idle">Enter your ingest key and tap Start to relay nearby Spotflow devices.</string>

@@ -37,14 +37,21 @@ class IngestKeyStore(context: Context) {
             if (value.isNullOrBlank()) remove(KEY_INGEST) else putString(KEY_INGEST, value)
         }.apply()
 
-    /** Store-and-forward buffer size in megabytes (default 50, min 1). */
-    var bufferMb: Int
-        get() = prefs.getInt(KEY_BUFFER_MB, DEFAULT_BUFFER_MB)
-        set(value) = prefs.edit().putInt(KEY_BUFFER_MB, value.coerceAtLeast(1)).apply()
+    /** RAM (in-memory) buffer tier size in megabytes (default 2, min 1). */
+    var bufferRamMb: Int
+        get() = prefs.getInt(KEY_BUFFER_RAM_MB, DEFAULT_BUFFER_RAM_MB)
+        set(value) = prefs.edit().putInt(KEY_BUFFER_RAM_MB, value.coerceAtLeast(1)).apply()
+
+    /** Flash (persistent) buffer tier size in megabytes (default 50, min 1). */
+    var bufferFlashMb: Int
+        get() = prefs.getInt(KEY_BUFFER_FLASH_MB, DEFAULT_BUFFER_FLASH_MB)
+        set(value) = prefs.edit().putInt(KEY_BUFFER_FLASH_MB, value.coerceAtLeast(1)).apply()
 
     private companion object {
         const val KEY_INGEST = "ingest_key"
-        const val KEY_BUFFER_MB = "buffer_mb"
-        const val DEFAULT_BUFFER_MB = 50
+        const val KEY_BUFFER_RAM_MB = "buffer_ram_mb"
+        const val DEFAULT_BUFFER_RAM_MB = 2
+        const val KEY_BUFFER_FLASH_MB = "buffer_flash_mb"
+        const val DEFAULT_BUFFER_FLASH_MB = 50
     }
 }
