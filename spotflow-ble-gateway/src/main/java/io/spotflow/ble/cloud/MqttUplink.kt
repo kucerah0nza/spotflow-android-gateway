@@ -35,12 +35,13 @@ class MqttUplink(
     val isConnected: Boolean get() = client.state.isConnected
 
     private fun buildClient(): Mqtt5AsyncClient {
+        // No automatic reconnect: the drainer owns the connect/reconnect lifecycle so it can keep
+        // buffering to disk while offline and flush when the network returns.
         var builder = MqttClient.builder()
             .useMqttVersion5()
             .identifier(deviceId)
             .serverHost(config.host)
             .serverPort(config.port)
-            .automaticReconnectWithDefaultConfig()
             .addConnectedListener { Log.i(TAG, "MQTT connected for $deviceId") }
             .addDisconnectedListener { Log.w(TAG, "MQTT disconnected for $deviceId: ${it.cause.message}") }
         if (config.useTls) {
@@ -78,14 +79,8 @@ class MqttUplink(
             .await()
     }
 
-    suspend fun publishTelemetry(payload: ByteArray) = publish(config.topics.ingest, payload)
-
-    suspend fun publishSessionMetadata(payload: ByteArray) = publish(config.topics.ingest, payload)
-
-    suspend fun publishReportedConfiguration(payload: ByteArray) =
-        publish(config.topics.reportedConfiguration, payload)
-
-    private suspend fun publish(topic: String, payload: ByteArray) {
+    /** Publishes one payload to [topic] at the configured QoS, suspending until acknowledged. */
+    suspend fun publish(topic: String, payload: ByteArray) {
         client.publishWith()
             .topic(topic)
             .qos(config.qos)

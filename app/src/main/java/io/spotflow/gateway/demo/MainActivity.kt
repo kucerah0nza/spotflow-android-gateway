@@ -15,6 +15,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import io.spotflow.ble.GatewayDeviceState
 import io.spotflow.ble.SpotflowGateway
+import io.spotflow.ble.cloud.MqttConfig
 import io.spotflow.ble.cloud.StaticIngestKey
 import io.spotflow.ble.service.SpotflowGatewayService
 import io.spotflow.ble.transport.ConnectionState
@@ -55,8 +56,9 @@ class MainActivity : AppCompatActivity() {
             insets
         }
 
-        // Prefill the previously saved ingest key.
+        // Prefill the previously saved ingest key and buffer size.
         binding.ingestKey.setText(keyStore.ingestKey)
+        binding.bufferMb.setText(keyStore.bufferMb.toString())
 
         binding.startButton.setOnClickListener {
             val key = binding.ingestKey.text?.toString()?.trim().orEmpty()
@@ -89,14 +91,20 @@ class MainActivity : AppCompatActivity() {
 
     private fun startGateway() {
         val key = binding.ingestKey.text?.toString()?.trim().orEmpty()
+        val bufferMb = binding.bufferMb.text?.toString()?.toIntOrNull()?.coerceAtLeast(1)
+            ?: keyStore.bufferMb
         keyStore.ingestKey = key // persist across restarts
-        SpotflowGatewayService.gatewayFactory = { ctx -> SpotflowGateway(ctx, StaticIngestKey(key)) }
+        keyStore.bufferMb = bufferMb
+
+        val config = MqttConfig(bufferMaxBytes = bufferMb.toLong() * 1024L * 1024L)
+        SpotflowGatewayService.gatewayFactory = { ctx -> SpotflowGateway(ctx, StaticIngestKey(key), config) }
         SpotflowGatewayService.onReady = { gateway -> gateway.startScanning() }
         SpotflowGatewayService.start(this)
 
         binding.startButton.isEnabled = false
         binding.stopButton.isEnabled = true
         binding.ingestKeyLayout.isEnabled = false
+        binding.bufferMb.isEnabled = false
         binding.errorBanner.visibility = View.GONE
         binding.status.text = getString(R.string.scanning)
     }
@@ -106,6 +114,7 @@ class MainActivity : AppCompatActivity() {
         binding.startButton.isEnabled = true
         binding.stopButton.isEnabled = false
         binding.ingestKeyLayout.isEnabled = true
+        binding.bufferMb.isEnabled = true
         binding.errorBanner.visibility = View.GONE
         binding.status.text = getString(R.string.idle)
     }
@@ -156,7 +165,14 @@ class MainActivity : AppCompatActivity() {
             appendLine("$marker ${d.deviceId ?: d.address}")
             appendLine("    ble:   ${d.ble}")
             appendLine("    cloud: $cloud")
-            append("    fwd:   ${d.forwarded} msgs")
+            appendLine("    fwd:   ${d.forwarded} msgs")
+            append("    buf:   ${humanBytes(d.bufferedBytes)}")
         }
+    }
+
+    private fun humanBytes(bytes: Long): String = when {
+        bytes >= 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
+        bytes >= 1024 -> "%.1f KB".format(bytes / 1024.0)
+        else -> "$bytes B"
     }
 }

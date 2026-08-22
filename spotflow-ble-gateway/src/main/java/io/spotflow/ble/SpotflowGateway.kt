@@ -87,7 +87,7 @@ class SpotflowGateway(
                 // autoConnect for reconnects so Android re-attaches whenever the device reappears.
                 val connection = connectionFactory(!firstAttempt)
                 try {
-                    GatewaySession(connection, credentials, mqttConfig, ::updateStatus).run()
+                    GatewaySession(context, connection, credentials, mqttConfig, ::updateStatus).run()
                     backoff = INITIAL_BACKOFF_MS // clean end; reset backoff before reconnect
                 } catch (t: MqttAuthException) {
                     // The ingest key won't change until the gateway is restarted; stop retrying.
@@ -119,7 +119,7 @@ class SpotflowGateway(
         val address = connection.deviceAddress
         jobs[address] = scope.launch {
             try {
-                GatewaySession(connection, credentials, mqttConfig, ::updateStatus).run()
+                GatewaySession(context, connection, credentials, mqttConfig, ::updateStatus).run()
             } catch (t: Throwable) {
                 updateStatus(currentOf(address).copy(error = t.message, cloudConnected = false))
             }

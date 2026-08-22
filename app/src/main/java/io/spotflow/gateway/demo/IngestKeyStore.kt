@@ -37,7 +37,14 @@ class IngestKeyStore(context: Context) {
             if (value.isNullOrBlank()) remove(KEY_INGEST) else putString(KEY_INGEST, value)
         }.apply()
 
+    /** Store-and-forward buffer size in megabytes (default 1, min 1). */
+    var bufferMb: Int
+        get() = prefs.getInt(KEY_BUFFER_MB, DEFAULT_BUFFER_MB)
+        set(value) = prefs.edit().putInt(KEY_BUFFER_MB, value.coerceAtLeast(1)).apply()
+
     private companion object {
         const val KEY_INGEST = "ingest_key"
+        const val KEY_BUFFER_MB = "buffer_mb"
+        const val DEFAULT_BUFFER_MB = 1
     }
 }
