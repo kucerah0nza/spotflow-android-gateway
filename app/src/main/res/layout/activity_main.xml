@@ -143,6 +143,21 @@
         </ScrollView>
     </com.google.android.material.card.MaterialCardView>
 
+    <!-- Bluetooth-off banner (tappable; shown while running if BT is turned off) -->
+    <TextView
+        android:id="@+id/btBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:background="?attr/colorErrorContainer"
+        android:clickable="true"
+        android:focusable="true"
+        android:padding="12dp"
+        android:text="@string/bluetooth_off_banner"
+        android:textColor="?attr/colorOnErrorContainer"
+        android:textSize="14sp"
+        android:visibility="gone" />
+
     <!-- Error banner (hidden unless there is an error) -->
     <TextView
         android:id="@+id/errorBanner"

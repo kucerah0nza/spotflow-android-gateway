@@ -83,6 +83,9 @@ class SpotflowGateway(
             } catch (t: Throwable) {
                 // e.g. Bluetooth turned off mid-scan; end the scan cleanly instead of crashing.
                 Log.w(TAG, "scanning stopped: ${t.message}")
+            } finally {
+                // Allow startScanning() to resume discovery later (e.g. once Bluetooth is back on).
+                jobs.remove(SCAN_JOB_KEY)
             }
         }
     }

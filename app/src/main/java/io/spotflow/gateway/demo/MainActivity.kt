@@ -3,14 +3,17 @@ package io.spotflow.gateway.demo
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
@@ -53,11 +56,30 @@ class MainActivity : AppCompatActivity() {
     private val enableBluetoothLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
             if (bluetoothAdapter?.isEnabled == true) {
-                startGateway()
+                // Initial-start flow. A mid-run re-enable is handled by bluetoothStateReceiver.
+                if (!isGatewayRunning) startGateway()
             } else {
                 Toast.makeText(this, R.string.bluetooth_required, Toast.LENGTH_LONG).show()
             }
         }
+
+    private val isGatewayRunning: Boolean get() = SpotflowGatewayService.gateway != null
+
+    /** Watches for Bluetooth being toggled while the gateway is running. */
+    private val bluetoothStateReceiver = object : BroadcastReceiver() {
+        @android.annotation.SuppressLint("MissingPermission")
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_OFF ->
+                    if (isGatewayRunning) binding.btBanner.visibility = View.VISIBLE
+                BluetoothAdapter.STATE_ON -> {
+                    binding.btBanner.visibility = View.GONE
+                    if (isGatewayRunning) SpotflowGatewayService.gateway?.startScanning()
+                }
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -88,7 +110,29 @@ class MainActivity : AppCompatActivity() {
 
         binding.stopButton.setOnClickListener { stopGateway() }
 
+        binding.btBanner.setOnClickListener {
+            enableBluetoothLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+        }
+
         observeDevices()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        ContextCompat.registerReceiver(
+            this,
+            bluetoothStateReceiver,
+            IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        // Reflect the current state (e.g. BT turned off while the app was backgrounded).
+        binding.btBanner.visibility =
+            if (isGatewayRunning && bluetoothAdapter?.isEnabled != true) View.VISIBLE else View.GONE
+    }
+
+    override fun onStop() {
+        super.onStop()
+        runCatching { unregisterReceiver(bluetoothStateReceiver) }
     }
 
     private fun requestPermissionsThenStart() {
@@ -145,6 +189,7 @@ class MainActivity : AppCompatActivity() {
         binding.ingestKeyLayout.isEnabled = true
         binding.bufferMb.isEnabled = true
         binding.errorBanner.visibility = View.GONE
+        binding.btBanner.visibility = View.GONE
         binding.status.text = getString(R.string.idle)
     }
 
