@@ -37,7 +37,7 @@ class IngestKeyStore(context: Context) {
             if (value.isNullOrBlank()) remove(KEY_INGEST) else putString(KEY_INGEST, value)
         }.apply()
 
-    /** RAM (in-memory) buffer tier size in megabytes (default 2, min 1). */
+    /** RAM (in-memory) buffer tier size in megabytes (default 1, min 1). */
     var bufferRamMb: Int
         get() = prefs.getInt(KEY_BUFFER_RAM_MB, DEFAULT_BUFFER_RAM_MB)
         set(value) = prefs.edit().putInt(KEY_BUFFER_RAM_MB, value.coerceAtLeast(1)).apply()
@@ -50,7 +50,7 @@ class IngestKeyStore(context: Context) {
     private companion object {
         const val KEY_INGEST = "ingest_key"
         const val KEY_BUFFER_RAM_MB = "buffer_ram_mb"
-        const val DEFAULT_BUFFER_RAM_MB = 2
+        const val DEFAULT_BUFFER_RAM_MB = 1
         const val KEY_BUFFER_FLASH_MB = "buffer_flash_mb"
         const val DEFAULT_BUFFER_FLASH_MB = 50
     }

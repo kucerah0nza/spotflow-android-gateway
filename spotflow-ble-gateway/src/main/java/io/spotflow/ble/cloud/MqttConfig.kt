@@ -34,7 +34,7 @@ data class MqttConfig(
      * Size of the in-memory (RAM) tier of the buffer, in bytes. In steady-state (online) operation data
      * flows through RAM only, so flash is not written; the buffer spills the oldest messages to the disk
      * tier only once RAM fills up (i.e. connectivity has been down long enough to accumulate a backlog).
-     * The trade-off is that data still in RAM is lost if the process is killed. Default 2 MiB.
+     * The trade-off is that data still in RAM is lost if the process is killed. Default 1 MiB.
      */
-    val ramBufferMaxBytes: Long = 2L * 1024 * 1024,
+    val ramBufferMaxBytes: Long = 1L * 1024 * 1024,
 )
