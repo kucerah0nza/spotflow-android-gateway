@@ -17,6 +17,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** Observable state of one device being gatewayed, surfaced to the host app / demo UI. */
 data class GatewayDeviceState(
@@ -141,7 +142,9 @@ internal class GatewaySession(
 
             val entry = queue.peek()
             if (entry == null) {
-                drainSignal.receiveCatching()
+                // Idle: wait for new data, but wake periodically to keep the MQTT link warm — so a
+                // drop during a quiet period is reconnected proactively instead of on the next message.
+                withTimeoutOrNull(IDLE_POLL_MS) { drainSignal.receiveCatching() }
                 continue
             }
 
@@ -177,5 +180,6 @@ internal class GatewaySession(
         const val INITIAL_BACKOFF_MS = 1_000L
         const val MAX_BACKOFF_MS = 30_000L
         const val MAX_PUBLISH_ATTEMPTS = 5
+        const val IDLE_POLL_MS = 15_000L
     }
 }

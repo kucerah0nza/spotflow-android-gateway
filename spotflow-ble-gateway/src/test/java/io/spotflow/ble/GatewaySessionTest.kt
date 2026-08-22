@@ -96,7 +96,7 @@ class GatewaySessionTest {
         assertTrue("data should be buffered", (last?.bufferedBytes ?: 0) > 0)
 
         uplink.failConnect = false
-        advanceUntilIdle()
+        advanceTimeBy(30_000); runCurrent()
 
         assertTrue("buffer should flush once online", uplink.published.isNotEmpty())
         assertEquals(0L, last?.bufferedBytes)
