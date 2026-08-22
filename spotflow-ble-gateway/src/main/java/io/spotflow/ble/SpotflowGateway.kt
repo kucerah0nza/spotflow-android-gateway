@@ -14,6 +14,7 @@ import io.spotflow.ble.transport.AttachedBleConnection
 import io.spotflow.ble.transport.ManagedBleConnection
 import io.spotflow.ble.transport.SpotflowGattSession
 import io.spotflow.ble.transport.SpotflowScanner
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -52,21 +53,36 @@ class SpotflowGateway(
     /** Live per-device status, keyed by Bluetooth address. */
     val devices: StateFlow<Map<String, GatewayDeviceState>> = _devices
 
-    private val adapter get() =
-        (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+    private val adapter: android.bluetooth.BluetoothAdapter?
+        get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+
+    /** True if the device has Bluetooth and it is currently turned on. */
+    val isBluetoothEnabled: Boolean get() = adapter?.isEnabled == true
 
     // ---- managed mode ----------------------------------------------------------------------------
 
     @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT])
     fun startScanning() {
         if (jobs.containsKey(SCAN_JOB_KEY)) return
+        val bluetoothAdapter = adapter
+        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
+            Log.w(TAG, "cannot scan: Bluetooth is ${if (bluetoothAdapter == null) "unavailable" else "off"}")
+            return
+        }
         jobs[SCAN_JOB_KEY] = scope.launch {
-            SpotflowScanner(adapter).scan().collect { device ->
-                if (!jobs.containsKey(device.address)) {
-                    launchManaged(device.address) { autoConnect ->
-                        ManagedBleConnection(context, device, requestedMtu, autoConnect)
+            try {
+                SpotflowScanner(bluetoothAdapter).scan().collect { device ->
+                    if (!jobs.containsKey(device.address)) {
+                        launchManaged(device.address) { autoConnect ->
+                            ManagedBleConnection(context, device, requestedMtu, autoConnect)
+                        }
                     }
                 }
+            } catch (c: CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                // e.g. Bluetooth turned off mid-scan; end the scan cleanly instead of crashing.
+                Log.w(TAG, "scanning stopped: ${t.message}")
             }
         }
     }

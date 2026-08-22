@@ -1,6 +1,10 @@
 package io.spotflow.gateway.demo
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
+import android.content.Context
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.view.View
@@ -33,12 +37,25 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private val keyStore by lazy { IngestKeyStore(this) }
 
+    private val bluetoothAdapter: BluetoothAdapter? by lazy {
+        (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+    }
+
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
             if (grants.values.all { it }) {
-                startGateway()
+                ensureBluetoothThenStart()
             } else {
                 Toast.makeText(this, R.string.permissions_required, Toast.LENGTH_LONG).show()
+            }
+        }
+
+    private val enableBluetoothLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            if (bluetoothAdapter?.isEnabled == true) {
+                startGateway()
+            } else {
+                Toast.makeText(this, R.string.bluetooth_required, Toast.LENGTH_LONG).show()
             }
         }
 
@@ -87,6 +104,18 @@ class MainActivity : AppCompatActivity() {
             }
         }
         permissionLauncher.launch(needed.toTypedArray())
+    }
+
+    /** Ensures Bluetooth is on before starting; prompts the user to enable it if needed. */
+    private fun ensureBluetoothThenStart() {
+        val adapter = bluetoothAdapter
+        when {
+            adapter == null ->
+                Toast.makeText(this, R.string.no_bluetooth, Toast.LENGTH_LONG).show()
+            !adapter.isEnabled ->
+                enableBluetoothLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+            else -> startGateway()
+        }
     }
 
     private fun startGateway() {

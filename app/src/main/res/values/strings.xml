@@ -10,5 +10,7 @@
     <string name="scanning">Scanning for Spotflow devices…</string>
     <string name="enter_key_first">Enter an ingest key first</string>
     <string name="permissions_required">Bluetooth and notification permissions are required to run the gateway</string>
+    <string name="bluetooth_required">Bluetooth must be on to run the gateway</string>
+    <string name="no_bluetooth">This device has no Bluetooth</string>
     <string name="auth_hint">Tap Stop, re-enter the ingest key, and Start again.</string>
 </resources>
