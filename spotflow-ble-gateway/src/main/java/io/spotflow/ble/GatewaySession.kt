@@ -7,6 +7,7 @@ import io.spotflow.ble.cloud.MqttAuthException
 import io.spotflow.ble.cloud.MqttConfig
 import io.spotflow.ble.cloud.MqttUplink
 import io.spotflow.ble.cloud.PersistentMessageQueue
+import io.spotflow.ble.cloud.StoreAndForwardBuffer
 import io.spotflow.ble.cloud.Uplink
 import io.spotflow.ble.protocol.MessageType
 import io.spotflow.ble.transport.BleConnection
@@ -64,7 +65,11 @@ internal class GatewaySession(
             val deviceId = connection.readDeviceId()
             push { it.copy(deviceId = deviceId) }
 
-            val queue = PersistentMessageQueue(context, deviceId, mqttConfig.bufferMaxBytes)
+            val diskMaxBytes = (mqttConfig.bufferMaxBytes - mqttConfig.ramBufferMaxBytes).coerceAtLeast(0)
+            val buffer = StoreAndForwardBuffer(
+                PersistentMessageQueue(context, deviceId, diskMaxBytes),
+                mqttConfig.ramBufferMaxBytes,
+            )
             val uplink = uplinkFactory(deviceId)
             uplink.desiredConfigurationHandler = { payload ->
                 launch { runCatching { connection.sendDesiredConfiguration(payload) } }
@@ -73,12 +78,12 @@ internal class GatewaySession(
 
             try {
                 runCatching {
-                    queue.enqueue(mqttConfig.topics.ingest, connection.readSessionMetadata())
-                    push { it.copy(bufferedBytes = queue.bytes) }
+                    buffer.enqueue(mqttConfig.topics.ingest, connection.readSessionMetadata())
+                    push { it.copy(bufferedBytes = buffer.bytes) }
                     drainSignal.trySend(Unit)
                 }
 
-                // BLE -> disk buffer (never blocks on the network).
+                // BLE -> buffer (RAM first; never blocks on the network).
                 val pump = launch {
                     connection.incoming.collect { message ->
                         val topic = when (message.type) {
@@ -86,14 +91,14 @@ internal class GatewaySession(
                             MessageType.REPORTED_CONFIGURATION -> mqttConfig.topics.reportedConfiguration
                             else -> return@collect
                         }
-                        queue.enqueue(topic, message.payload)
-                        push { it.copy(bufferedBytes = queue.bytes) }
+                        buffer.enqueue(topic, message.payload)
+                        push { it.copy(bufferedBytes = buffer.bytes) }
                         drainSignal.trySend(Unit)
                     }
                 }
 
-                // Disk buffer -> MQTT, owning connect/reconnect so offline just keeps buffering.
-                val drainer = launch { drain(uplink, queue, drainSignal, ::push) }
+                // Buffer -> MQTT, owning connect/reconnect so offline just keeps buffering.
+                val drainer = launch { drain(uplink, buffer, drainSignal, ::push) }
 
                 try {
                     connection.state.first {
@@ -105,7 +110,7 @@ internal class GatewaySession(
                 }
             } finally {
                 uplink.disconnect()
-                queue.close()
+                buffer.close()
                 push { it.copy(cloudConnected = false) }
             }
         } finally {
@@ -116,7 +121,7 @@ internal class GatewaySession(
 
     private suspend fun drain(
         uplink: Uplink,
-        queue: PersistentMessageQueue,
+        buffer: StoreAndForwardBuffer,
         drainSignal: Channel<Unit>,
         push: ((GatewayDeviceState) -> GatewayDeviceState) -> Unit,
     ) {
@@ -140,8 +145,8 @@ internal class GatewaySession(
                 }
             }
 
-            val entry = queue.peek()
-            if (entry == null) {
+            val item = buffer.takeNext()
+            if (item == null) {
                 // Idle: wait for new data, but wake periodically to keep the MQTT link warm — so a
                 // drop during a quiet period is reconnected proactively instead of on the next message.
                 withTimeoutOrNull(IDLE_POLL_MS) { drainSignal.receiveCatching() }
@@ -149,11 +154,11 @@ internal class GatewaySession(
             }
 
             try {
-                uplink.publish(entry.topic, entry.payload)
-                queue.remove(entry.id)
+                uplink.publish(item.topic, item.payload)
+                buffer.remove(item)
                 attempts = 0
                 backoff = INITIAL_BACKOFF_MS
-                push { it.copy(forwarded = it.forwarded + 1, bufferedBytes = queue.bytes) }
+                push { it.copy(forwarded = it.forwarded + 1, bufferedBytes = buffer.bytes) }
             } catch (c: CancellationException) {
                 throw c
             } catch (t: Throwable) {
@@ -161,14 +166,17 @@ internal class GatewaySession(
                     // Connected but the publish failed: likely a poison message (e.g. too large).
                     // Retry a few times, then drop it so it can't block the whole buffer forever.
                     if (++attempts >= MAX_PUBLISH_ATTEMPTS) {
-                        Log.w(TAG, "dropping message ${entry.id} after $attempts failures: ${t.message}")
-                        queue.remove(entry.id)
+                        Log.w(TAG, "dropping message after $attempts failures: ${t.message}")
+                        buffer.remove(item)
                         attempts = 0
-                        push { it.copy(bufferedBytes = queue.bytes) }
+                    } else {
+                        buffer.requeue(item)
                     }
                 } else {
+                    buffer.requeue(item)
                     push { it.copy(cloudConnected = false) }
                 }
+                push { it.copy(bufferedBytes = buffer.bytes) }
                 delay(backoff)
                 backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
             }

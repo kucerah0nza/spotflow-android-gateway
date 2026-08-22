@@ -121,10 +121,13 @@ flowchart TD
 
 - **Reconnect** — in managed mode a dropped link is reconnected automatically: a direct connect first,
   then `autoConnect` so Android re-attaches the moment a known device reappears, with exponential backoff.
-- **Store-and-forward buffer** — reassembled messages are written to a crash-safe, byte-bounded per-device
-  SQLite FIFO before publishing. When the phone is offline they accumulate (oldest evicted when full — a
-  circular buffer) and flush in order once connectivity returns. The buffer is on disk, so it survives the
-  app being killed or the phone rebooting mid-outage. Size is `MqttConfig.bufferMaxBytes` (default 50 MiB).
+- **Store-and-forward buffer** — a two-tier buffer keeps diagnostics flowing through outages without
+  wearing the flash. In steady state messages flow through a small **RAM tier only** (no disk writes);
+  once the RAM tier fills (`ramBufferMaxBytes`, default 2 MiB — i.e. the network has been down a while) the
+  oldest messages **spill to a crash-safe, byte-bounded per-device SQLite tier** that survives the app
+  being killed or the phone rebooting. Total size is bounded by `bufferMaxBytes` (default 50 MiB),
+  evict-oldest when full, and everything drains in FIFO order once connectivity returns. Trade-off: data
+  still in the RAM tier is lost if the process is killed.
 - **Bluetooth off** — the app prompts to enable Bluetooth before starting, and shows a tappable banner if
   it is turned off while running, resuming automatically when it comes back. The library's `startScanning()`
   no-ops (rather than crashing) when Bluetooth is unavailable.
