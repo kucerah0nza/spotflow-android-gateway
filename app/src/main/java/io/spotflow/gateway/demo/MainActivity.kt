@@ -240,7 +240,8 @@ class MainActivity : AppCompatActivity() {
             appendLine("    ble:   ${d.ble}")
             appendLine("    cloud: $cloud")
             appendLine("    fwd:   ${d.forwarded} msgs")
-            append("    buf:   ${humanBytes(d.bufferedBytes)}")
+            appendLine("    ram:   ${humanBytes(d.ramBytes)}")
+            append("    flash: ${humanBytes(d.diskBytes)}")
         }
     }
 

@@ -28,18 +28,24 @@ internal class StoreAndForwardBuffer(
 
     private val lock = Any()
     private val ram = ArrayDeque<Item>()
-    private var ramBytes = 0L
+    private var ramTierBytes = 0L
+
+    /** Bytes currently held in the in-memory tier. */
+    val ramBytes: Long get() = synchronized(lock) { ramTierBytes }
+
+    /** Bytes currently held in the persistent (flash) tier. */
+    val diskBytes: Long get() = synchronized(lock) { disk.bytes }
 
     /** Total buffered bytes across both tiers. */
-    val bytes: Long get() = synchronized(lock) { ramBytes + disk.bytes }
+    val bytes: Long get() = synchronized(lock) { ramTierBytes + disk.bytes }
 
     /** Appends a message to RAM, spilling the oldest RAM messages to disk if RAM is over its cap. */
     fun enqueue(topic: String, payload: ByteArray) = synchronized(lock) {
         ram.addLast(Item(topic, payload, diskId = null))
-        ramBytes += payload.size
-        while (ramBytes > ramMaxBytes && ram.size > 1) {
+        ramTierBytes += payload.size
+        while (ramTierBytes > ramMaxBytes && ram.size > 1) {
             val oldest = ram.removeFirst()
-            ramBytes -= oldest.payload.size
+            ramTierBytes -= oldest.payload.size
             disk.enqueue(oldest.topic, oldest.payload)
         }
     }
@@ -53,7 +59,7 @@ internal class StoreAndForwardBuffer(
         if (disk.bytes > 0L) {
             disk.peek()?.let { Item(it.topic, it.payload, diskId = it.id) }
         } else {
-            ram.removeFirstOrNull()?.also { ramBytes -= it.payload.size }
+            ram.removeFirstOrNull()?.also { ramTierBytes -= it.payload.size }
         }
     }
 
@@ -67,7 +73,7 @@ internal class StoreAndForwardBuffer(
     fun requeue(item: Item) = synchronized(lock) {
         if (item.diskId == null) {
             ram.addFirst(item)
-            ramBytes += item.payload.size
+            ramTierBytes += item.payload.size
         }
         // Disk items were only peeked, so they are still queued.
     }

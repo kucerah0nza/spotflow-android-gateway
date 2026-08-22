@@ -27,7 +27,10 @@ data class GatewayDeviceState(
     val ble: ConnectionState = ConnectionState.DISCONNECTED,
     val cloudConnected: Boolean = false,
     val forwarded: Long = 0,
-    val bufferedBytes: Long = 0,
+    /** Bytes buffered in the in-memory tier (normal while briefly offline). */
+    val ramBytes: Long = 0,
+    /** Bytes spilled to the persistent (flash) tier (only after a longer outage). */
+    val diskBytes: Long = 0,
     val error: String? = null,
 )
 
@@ -79,7 +82,7 @@ internal class GatewaySession(
             try {
                 runCatching {
                     buffer.enqueue(mqttConfig.topics.ingest, connection.readSessionMetadata())
-                    push { it.copy(bufferedBytes = buffer.bytes) }
+                    push { it.copy(ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
                     drainSignal.trySend(Unit)
                 }
 
@@ -92,7 +95,7 @@ internal class GatewaySession(
                             else -> return@collect
                         }
                         buffer.enqueue(topic, message.payload)
-                        push { it.copy(bufferedBytes = buffer.bytes) }
+                        push { it.copy(ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
                         drainSignal.trySend(Unit)
                     }
                 }
@@ -158,7 +161,7 @@ internal class GatewaySession(
                 buffer.remove(item)
                 attempts = 0
                 backoff = INITIAL_BACKOFF_MS
-                push { it.copy(forwarded = it.forwarded + 1, bufferedBytes = buffer.bytes) }
+                push { it.copy(forwarded = it.forwarded + 1, ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
             } catch (c: CancellationException) {
                 throw c
             } catch (t: Throwable) {
@@ -176,7 +179,7 @@ internal class GatewaySession(
                     buffer.requeue(item)
                     push { it.copy(cloudConnected = false) }
                 }
-                push { it.copy(bufferedBytes = buffer.bytes) }
+                push { it.copy(ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
                 delay(backoff)
                 backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
             }

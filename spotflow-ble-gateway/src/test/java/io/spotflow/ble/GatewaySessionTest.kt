@@ -93,13 +93,14 @@ class GatewaySessionTest {
         advanceTimeBy(5_000); runCurrent()
 
         assertTrue("nothing should publish while offline", uplink.published.isEmpty())
-        assertTrue("data should be buffered", (last?.bufferedBytes ?: 0) > 0)
+        assertTrue("data should be buffered in RAM", (last?.ramBytes ?: 0) > 0)
 
         uplink.failConnect = false
         advanceTimeBy(30_000); runCurrent()
 
         assertTrue("buffer should flush once online", uplink.published.isNotEmpty())
-        assertEquals(0L, last?.bufferedBytes)
+        assertEquals(0L, last?.ramBytes)
+        assertEquals(0L, last?.diskBytes)
         ble.drop(); runCurrent(); job.cancel()
     }
 
