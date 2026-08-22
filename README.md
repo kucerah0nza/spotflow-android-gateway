@@ -119,8 +119,10 @@ flowchart TD
     E --> C
 ```
 
-- **Reconnect** — in managed mode a dropped link is reconnected automatically: a direct connect first,
-  then `autoConnect` so Android re-attaches the moment a known device reappears, with exponential backoff.
+- **Reconnect** — a dropped BLE link is reconnected automatically (a direct connect first, then
+  `autoConnect` so Android re-attaches the moment a known device reappears, with exponential backoff). The
+  MQTT uplink reconnects on its own too, and the drainer keeps the link warm during idle periods so the
+  status stays connected rather than only reconnecting when the next message arrives.
 - **Store-and-forward buffer** — a two-tier buffer keeps diagnostics flowing through outages without
   wearing the flash. In steady state messages flow through a small **RAM tier only** (no disk writes);
   once the RAM tier fills (`ramBufferMaxBytes`, default 2 MiB — i.e. the network has been down a while) the
@@ -128,9 +130,11 @@ flowchart TD
   being killed or the phone rebooting. Total size is bounded by `bufferMaxBytes` (default 50 MiB),
   evict-oldest when full, and everything drains in FIFO order once connectivity returns. Trade-off: data
   still in the RAM tier is lost if the process is killed.
-- **Bluetooth off** — the app prompts to enable Bluetooth before starting, and shows a tappable banner if
-  it is turned off while running, resuming automatically when it comes back. The library's `startScanning()`
-  no-ops (rather than crashing) when Bluetooth is unavailable.
+- **Bluetooth off/on** — the gateway watches the Bluetooth adapter itself, so turning Bluetooth off and
+  back on tears down and re-establishes sessions automatically — even with the screen off, since it runs in
+  the foreground service. (Turning Bluetooth off often doesn't deliver a GATT disconnect callback, which
+  would otherwise leave a session parked forever.) The demo app additionally prompts to enable Bluetooth
+  before starting and shows a tappable banner if it's turned off while running.
 - **Cloud errors** — a rejected ingest key surfaces the broker's CONNACK reason (e.g.
   `BAD_USER_NAME_OR_PASSWORD`) as `MqttAuthException` and stops retrying instead of hammering the broker.
 
@@ -141,7 +145,8 @@ val gateway = SpotflowGateway(
     context,
     credentials = StaticIngestKey(key),   // or implement CredentialsProvider for rotation / per-device keys
     mqttConfig = MqttConfig(
-        bufferMaxBytes = 50L * 1024 * 1024,
+        bufferMaxBytes = 50L * 1024 * 1024,     // total store-and-forward buffer (RAM + disk)
+        ramBufferMaxBytes = 2L * 1024 * 1024,   // RAM tier; spills to disk only past this
         // host / port / qos / topics are configurable; defaults target production
     ),
 )
