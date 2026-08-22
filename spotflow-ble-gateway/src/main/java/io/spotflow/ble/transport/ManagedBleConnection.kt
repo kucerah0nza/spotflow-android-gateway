@@ -1,5 +1,6 @@
 package io.spotflow.ble.transport
 
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
 import android.content.Context
 import io.spotflow.ble.protocol.GattProfile
@@ -31,6 +32,8 @@ class ManagedBleConnection(
     override val incoming: Flow<io.spotflow.ble.protocol.Message> get() = session.incoming
     override val mtu: Int get() = session.mtu
 
+    // The host is responsible for holding BLUETOOTH_CONNECT (documented in the README/manifest).
+    @SuppressLint("MissingPermission")
     override suspend fun prepare() {
         session.connect { callback ->
             device.connectGatt(context, autoConnect, callback, BluetoothDevice.TRANSPORT_LE)
