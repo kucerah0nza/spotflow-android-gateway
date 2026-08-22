@@ -26,7 +26,7 @@ data class MqttConfig(
     /**
      * Max size of the on-disk store-and-forward buffer per device, in bytes. Messages received over BLE
      * are persisted here and drained to MQTT when the network is available; when the buffer is full the
-     * oldest messages are evicted. Default 1 MiB.
+     * oldest messages are evicted. Default 50 MiB.
      */
-    val bufferMaxBytes: Long = 1L * 1024 * 1024,
+    val bufferMaxBytes: Long = 50L * 1024 * 1024,
 )
