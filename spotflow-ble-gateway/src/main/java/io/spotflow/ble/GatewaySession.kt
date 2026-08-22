@@ -7,6 +7,7 @@ import io.spotflow.ble.cloud.MqttAuthException
 import io.spotflow.ble.cloud.MqttConfig
 import io.spotflow.ble.cloud.MqttUplink
 import io.spotflow.ble.cloud.PersistentMessageQueue
+import io.spotflow.ble.cloud.Uplink
 import io.spotflow.ble.protocol.MessageType
 import io.spotflow.ble.transport.BleConnection
 import io.spotflow.ble.transport.ConnectionState
@@ -42,6 +43,8 @@ internal class GatewaySession(
     private val credentials: CredentialsProvider,
     private val mqttConfig: MqttConfig,
     private val onStatus: (GatewayDeviceState) -> Unit,
+    private val uplinkFactory: (deviceId: String) -> Uplink =
+        { id -> MqttUplink(id, credentials, mqttConfig) },
 ) {
     /** Runs until the connection is torn down or the coroutine is cancelled. */
     suspend fun run() = coroutineScope {
@@ -61,7 +64,7 @@ internal class GatewaySession(
             push { it.copy(deviceId = deviceId) }
 
             val queue = PersistentMessageQueue(context, deviceId, mqttConfig.bufferMaxBytes)
-            val uplink = MqttUplink(deviceId, credentials, mqttConfig)
+            val uplink = uplinkFactory(deviceId)
             uplink.desiredConfigurationHandler = { payload ->
                 launch { runCatching { connection.sendDesiredConfiguration(payload) } }
             }
@@ -111,7 +114,7 @@ internal class GatewaySession(
     }
 
     private suspend fun drain(
-        uplink: MqttUplink,
+        uplink: Uplink,
         queue: PersistentMessageQueue,
         drainSignal: Channel<Unit>,
         push: ((GatewayDeviceState) -> GatewayDeviceState) -> Unit,

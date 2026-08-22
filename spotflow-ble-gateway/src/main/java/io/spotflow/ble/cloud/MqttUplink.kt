@@ -25,14 +25,14 @@ class MqttUplink(
     private val deviceId: String,
     private val credentials: CredentialsProvider,
     private val config: MqttConfig = MqttConfig(),
-) {
+) : Uplink {
     /** Invoked (off the caller's thread) when a DESIRED_CONFIGURATION payload arrives from the cloud. */
     @Volatile
-    var desiredConfigurationHandler: ((ByteArray) -> Unit)? = null
+    override var desiredConfigurationHandler: ((ByteArray) -> Unit)? = null
 
     private val client: Mqtt5AsyncClient = buildClient()
 
-    val isConnected: Boolean get() = client.state.isConnected
+    override val isConnected: Boolean get() = client.state.isConnected
 
     private fun buildClient(): Mqtt5AsyncClient {
         // No automatic reconnect: the drainer owns the connect/reconnect lifecycle so it can keep
@@ -54,7 +54,7 @@ class MqttUplink(
      * Connects and subscribes to the desired-configuration topic. Throws [MqttAuthException] if the
      * broker rejects the credentials, or [MqttConnectException] for other connect failures.
      */
-    suspend fun connect() {
+    override suspend fun connect() {
         val ingestKey = credentials.ingestKey(deviceId)
         try {
             client.connectWith()
@@ -80,7 +80,7 @@ class MqttUplink(
     }
 
     /** Publishes one payload to [topic] at the configured QoS, suspending until acknowledged. */
-    suspend fun publish(topic: String, payload: ByteArray) {
+    override suspend fun publish(topic: String, payload: ByteArray) {
         client.publishWith()
             .topic(topic)
             .qos(config.qos)
@@ -89,7 +89,7 @@ class MqttUplink(
             .await()
     }
 
-    suspend fun disconnect() {
+    override suspend fun disconnect() {
         runCatching { client.disconnect().await() }
     }
 
