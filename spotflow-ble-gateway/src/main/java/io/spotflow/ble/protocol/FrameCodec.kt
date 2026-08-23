@@ -109,7 +109,13 @@ object FrameCodec {
 
         private val partials = HashMap<Key, Partial>()
 
-        /** Feeds one raw notification frame. Returns a [Message] when a message completes, else null. */
+        /**
+         * Feeds one raw notification frame. Returns a [Message] when a message completes, else null.
+         *
+         * Synchronized because it is called on the BLE binder thread while [reset] may be called from a
+         * coroutine during teardown.
+         */
+        @Synchronized
         fun onFragment(raw: ByteArray): Message? {
             if (raw.size < HEADER_CONTINUATION) return null
 
@@ -148,6 +154,7 @@ object FrameCodec {
         }
 
         /** Drops any in-flight partial messages (e.g. after a disconnect). */
+        @Synchronized
         fun reset() = partials.clear()
     }
 }

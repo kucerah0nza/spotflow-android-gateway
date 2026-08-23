@@ -13,11 +13,13 @@ import io.spotflow.ble.protocol.MessageType
 import io.spotflow.ble.transport.BleConnection
 import io.spotflow.ble.transport.ConnectionState
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /** Observable state of one device being gatewayed, surfaced to the host app / demo UI. */
@@ -54,9 +56,14 @@ internal class GatewaySession(
     /** Runs until the connection is torn down or the coroutine is cancelled. */
     suspend fun run() = coroutineScope {
         var status = GatewayDeviceState(connection.deviceAddress)
+        val statusLock = Any()
+        // Guarded: the state mirror, pump, and drainer all push concurrently on a multi-threaded
+        // dispatcher, so an unsynchronized read-modify-write would lose updates.
         fun push(update: (GatewayDeviceState) -> GatewayDeviceState) {
-            status = update(status)
-            onStatus(status)
+            synchronized(statusLock) {
+                status = update(status)
+                onStatus(status)
+            }
         }
 
         val stateJob = launch {
@@ -112,11 +119,14 @@ internal class GatewaySession(
                     drainer.cancel()
                 }
             } finally {
-                uplink.disconnect()
-                // Preserve any unsent data across the reconnect instead of dropping the RAM tier.
-                buffer.flushToDisk()
-                push { it.copy(cloudConnected = false, ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
-                buffer.close()
+                // NonCancellable so this cleanup runs to completion even when the session is cancelled
+                // (Stop / Bluetooth off) — otherwise the flush that preserves unsent data could be skipped.
+                withContext(NonCancellable) {
+                    uplink.disconnect()
+                    buffer.flushToDisk() // preserve unsent data across the reconnect
+                    push { it.copy(cloudConnected = false, ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
+                    buffer.close()
+                }
             }
         } finally {
             stateJob.cancel()
