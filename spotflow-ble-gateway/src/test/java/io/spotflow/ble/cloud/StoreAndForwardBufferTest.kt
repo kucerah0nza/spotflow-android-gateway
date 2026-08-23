@@ -49,7 +49,7 @@ class StoreAndForwardBufferTest {
     fun `stays in RAM under the cap`() {
         open(ramMaxBytes = 100)
         buffer.enqueue("t", payload(1))
-        buffer.enqueue("t", payload(2)) // 80 bytes total, under cap
+        buffer.enqueue("t", payload(2)) // 80 bytes, under cap
 
         assertEquals("disk tier must be untouched", 0L, disk.bytes)
         assertEquals(80L, buffer.bytes)
@@ -65,9 +65,7 @@ class StoreAndForwardBufferTest {
 
         assertEquals(40L, disk.bytes)
         assertEquals(120L, buffer.bytes)
-
-        val first = buffer.takeNext()!!
-        assertEquals("disk (oldest) drained first", 1, first.payload[0].toInt())
+        assertEquals("disk (oldest) drained first", 1, buffer.takeNext()!!.payload[0].toInt())
     }
 
     @Test
@@ -79,19 +77,37 @@ class StoreAndForwardBufferTest {
     }
 
     @Test
-    fun `requeue returns a RAM item for retry`() {
+    fun `takeNext only peeks`() {
         open(ramMaxBytes = 1000)
         buffer.enqueue("t", payload(7))
 
-        val item = buffer.takeNext()!! // popped from RAM
-        assertNull(buffer.takeNext()) // nothing left
-        buffer.requeue(item)
-        assertEquals(7, buffer.takeNext()!!.payload[0].toInt())
+        val a = buffer.takeNext()!!
+        val b = buffer.takeNext()!! // same item — peek does not remove
+        assertEquals(a.seq, b.seq)
+        buffer.remove(a)
+        assertNull(buffer.takeNext())
+    }
+
+    @Test
+    fun `remove finalizes an item spilled to disk mid-publish`() {
+        open(ramMaxBytes = 40) // any second item forces the first to spill
+        buffer.enqueue("t", payload(1))
+        val inflight = buffer.takeNext()!! // peeked from RAM (seq 1)
+        assertEquals(1, inflight.payload[0].toInt())
+
+        // While "publishing", more data arrives and spills the in-flight item to disk.
+        buffer.enqueue("t", payload(2))
+        assertTrue(disk.bytes > 0)
+
+        // Finalizing by sequence must remove it from disk (no duplicate, no reorder).
+        buffer.remove(inflight)
+        assertEquals(0L, disk.bytes)
+        assertEquals(2, buffer.takeNext()!!.payload[0].toInt())
     }
 
     @Test
     fun `flushToDisk moves RAM items to the persistent tier in order`() {
-        open(ramMaxBytes = 10_000) // everything stays in RAM until we flush
+        open(ramMaxBytes = 10_000)
         buffer.enqueue("t", payload(1))
         buffer.enqueue("t", payload(2))
         assertEquals(0L, disk.bytes)
@@ -100,20 +116,5 @@ class StoreAndForwardBufferTest {
 
         assertTrue("data should now be on disk", disk.bytes > 0)
         assertEquals(listOf(1, 2), drainMarkers())
-    }
-
-    @Test
-    fun `remove finalizes a disk item`() {
-        open(ramMaxBytes = 40) // tiny, so the second enqueue spills the first to disk
-        buffer.enqueue("t", payload(1))
-        buffer.enqueue("t", payload(2))
-        assertTrue(disk.bytes > 0)
-
-        val diskItem = buffer.takeNext()!!
-        assertEquals(1, diskItem.payload[0].toInt())
-        buffer.requeue(diskItem) // disk item stays queued
-        assertEquals(1, buffer.takeNext()!!.payload[0].toInt())
-        buffer.remove(buffer.takeNext()!!) // remove marker 1 for good
-        assertEquals(0L, disk.bytes)
     }
 }

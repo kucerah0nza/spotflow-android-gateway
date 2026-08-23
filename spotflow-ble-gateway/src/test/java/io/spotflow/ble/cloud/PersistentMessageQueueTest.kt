@@ -18,12 +18,14 @@ class PersistentMessageQueueTest {
     /** A payload whose every byte equals [marker], so survivors are identifiable. */
     private fun payload(marker: Int, size: Int) = ByteArray(size) { marker.toByte() }
 
+    /** Enqueue using the marker as the sequence number, so seq == marker. */
+    private fun put(marker: Int, size: Int) = queue.enqueue(marker.toLong(), "t", payload(marker, size))
+
     private fun open(maxBytes: Long, device: String = "dev") =
         PersistentMessageQueue(context, device, maxBytes).also { queue = it }
 
     @Before
     fun setUp() {
-        // Start each test from a clean database.
         context.deleteDatabase("spotflow_buffer_dev.db")
     }
 
@@ -35,67 +37,65 @@ class PersistentMessageQueueTest {
     @Test
     fun `fifo order and removal`() {
         open(maxBytes = 10_000)
-        queue.enqueue("t", payload(1, 4))
-        queue.enqueue("t", payload(2, 4))
-        queue.enqueue("t", payload(3, 4))
+        put(1, 4); put(2, 4); put(3, 4)
 
         val first = queue.peek()!!
-        assertEquals(1, first.payload[0].toInt())
-        queue.remove(first.id)
-        assertEquals(2, queue.peek()!!.payload[0].toInt())
+        assertEquals(1L, first.seq)
+        queue.remove(first.seq)
+        assertEquals(2L, queue.peek()!!.seq)
     }
 
     @Test
     fun `bytes accounting tracks enqueue and remove`() {
         open(maxBytes = 10_000)
-        queue.enqueue("t", payload(1, 100))
-        queue.enqueue("t", payload(2, 50))
-        assertEquals(150, queue.bytes)
+        put(1, 100); put(2, 50)
+        assertEquals(150L, queue.bytes)
 
-        queue.remove(queue.peek()!!.id)
-        assertEquals(50, queue.bytes)
+        queue.remove(queue.peek()!!.seq)
+        assertEquals(50L, queue.bytes)
     }
 
     @Test
     fun `eviction drops oldest to stay within cap`() {
         open(maxBytes = 100)
-        queue.enqueue("t", payload(1, 40))
-        queue.enqueue("t", payload(2, 40))
-        queue.enqueue("t", payload(3, 40)) // 120 > 100 -> evict marker 1
+        put(1, 40); put(2, 40); put(3, 40) // 120 > 100 -> evict seq 1
 
-        assertEquals(80, queue.bytes)
-        assertEquals(2, queue.peek()!!.payload[0].toInt())
+        assertEquals(80L, queue.bytes)
+        assertEquals(2L, queue.peek()!!.seq)
 
-        queue.enqueue("t", payload(4, 40)) // evict marker 2
-        assertEquals(80, queue.bytes)
-        assertEquals(3, queue.peek()!!.payload[0].toInt())
+        put(4, 40) // evict seq 2
+        assertEquals(80L, queue.bytes)
+        assertEquals(3L, queue.peek()!!.seq)
     }
 
     @Test
     fun `single payload larger than cap is kept alone`() {
         open(maxBytes = 100)
-        queue.enqueue("t", payload(9, 200))
-        assertEquals(200, queue.bytes)
-        assertEquals(9, queue.peek()!!.payload[0].toInt())
+        put(9, 200)
+        assertEquals(200L, queue.bytes)
+        assertEquals(9L, queue.peek()!!.seq)
     }
 
     @Test
-    fun `survives close and reopen`() {
+    fun `survives close and reopen and reports maxSeq`() {
         open(maxBytes = 10_000)
-        queue.enqueue("cfg", payload(7, 30))
+        queue.enqueue(7L, "cfg", payload(7, 30))
+        assertEquals(7L, queue.maxSeq())
         queue.close()
 
         open(maxBytes = 10_000)
         val entry = queue.peek()!!
         assertEquals("cfg", entry.topic)
-        assertEquals(7, entry.payload[0].toInt())
-        assertEquals(30, queue.bytes)
+        assertEquals(7L, entry.seq)
+        assertEquals(30L, queue.bytes)
+        assertEquals(7L, queue.maxSeq())
     }
 
     @Test
     fun `peek on empty queue returns null`() {
         open(maxBytes = 10_000)
         assertNull(queue.peek())
-        assertEquals(0, queue.bytes)
+        assertEquals(0L, queue.bytes)
+        assertEquals(0L, queue.maxSeq())
     }
 }
