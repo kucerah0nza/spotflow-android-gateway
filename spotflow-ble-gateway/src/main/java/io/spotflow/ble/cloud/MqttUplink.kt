@@ -18,8 +18,9 @@ import kotlin.coroutines.resumeWithException
  * ingest key from [credentials]. Reassembled BLE messages are published as CBOR payloads; desired
  * configuration arriving from the cloud is delivered to [desiredConfigurationHandler].
  *
- * TLS uses the Android system trust store (Let's Encrypt ISRG Root X1), so no CA is bundled. The client
- * reconnects automatically and buffers outgoing publishes while briefly disconnected.
+ * TLS uses the Android system trust store (Let's Encrypt ISRG Root X1), so no CA is bundled. This client
+ * does not reconnect on its own — the gateway's drainer owns the connect/reconnect lifecycle so it can
+ * keep buffering to disk while offline and flush when the network returns.
  */
 class MqttUplink(
     private val deviceId: String,
@@ -67,16 +68,20 @@ class MqttUplink(
                 .sessionExpiryInterval(SESSION_EXPIRY_SECONDS)
                 .send()
                 .await()
+
+            // Subscribe inside the same try: a subscribe failure must not leave the client connected
+            // but unsubscribed (which would silently break the desired-config downlink).
+            client.subscribeWith()
+                .topicFilter(config.topics.desiredConfiguration)
+                .qos(config.qos)
+                .callback(::onCloudMessage)
+                .send()
+                .await()
         } catch (t: Throwable) {
+            // Ensure we never leave a half-established connection; force a clean reconnect next time.
+            runCatching { client.disconnect().await() }
             throw translateConnectError(t)
         }
-
-        client.subscribeWith()
-            .topicFilter(config.topics.desiredConfiguration)
-            .qos(config.qos)
-            .callback(::onCloudMessage)
-            .send()
-            .await()
     }
 
     /** Publishes one payload to [topic] at the configured QoS, suspending until acknowledged. */
