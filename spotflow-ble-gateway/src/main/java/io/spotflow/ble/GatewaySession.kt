@@ -159,7 +159,22 @@ internal class GatewaySession(
             }
 
             try {
-                uplink.publish(item.topic, item.payload)
+                val published = withTimeoutOrNull(PUBLISH_TIMEOUT_MS) {
+                    uplink.publish(item.topic, item.payload)
+                    true
+                } != null
+
+                if (!published) {
+                    // The publish stalled although the client still reports connected — typically a
+                    // half-open connection on a flaky network. Force a reconnect so a hung publish can't
+                    // block the buffer and make it fill up while the link looks connected.
+                    Log.w(TAG, "publish stalled >${PUBLISH_TIMEOUT_MS}ms; forcing reconnect")
+                    buffer.requeue(item)
+                    runCatching { uplink.disconnect() }
+                    push { it.copy(cloudConnected = false, ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
+                    continue
+                }
+
                 buffer.remove(item)
                 attempts = 0
                 backoff = INITIAL_BACKOFF_MS
@@ -195,5 +210,6 @@ internal class GatewaySession(
         const val MAX_BACKOFF_MS = 30_000L
         const val MAX_PUBLISH_ATTEMPTS = 5
         const val IDLE_POLL_MS = 15_000L
+        const val PUBLISH_TIMEOUT_MS = 20_000L
     }
 }
