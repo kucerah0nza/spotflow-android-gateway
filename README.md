@@ -10,6 +10,9 @@ The goal is drop-in integration for hardware vendors who already ship an Android
 smart thermostat): add the library, hand it a connection or let it scan, and their BLE devices show up in
 Spotflow.
 
+> **Download:** prebuilt debug APKs are attached to each [GitHub Release](../../releases) (published
+> automatically on every `v*` tag). Sideload one to try the demo gateway without building.
+
 ## Modules
 
 | Module | Purpose |
