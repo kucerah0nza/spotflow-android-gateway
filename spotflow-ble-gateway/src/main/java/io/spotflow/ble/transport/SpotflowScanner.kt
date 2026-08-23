@@ -30,8 +30,10 @@ class SpotflowScanner(private val adapter: BluetoothAdapter) {
         val filter = ScanFilter.Builder()
             .setServiceUuid(ParcelUuid(GattProfile.SERVICE))
             .build()
+        // BALANCED rather than LOW_LATENCY: this scan runs continuously for the life of the gateway, so
+        // it must be power-friendly. Discovery of a new device just takes a little longer.
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
             .build()
 
         val callback = object : ScanCallback() {

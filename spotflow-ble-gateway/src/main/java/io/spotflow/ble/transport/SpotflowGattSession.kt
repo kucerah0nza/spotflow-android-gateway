@@ -20,6 +20,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.IOException
 
 /**
  * The shared GATT engine used by both [ManagedBleConnection] and [AttachedBleConnection].
@@ -40,9 +42,18 @@ internal class SpotflowGattSession(
     companion object {
         private const val TAG = "SpotflowGatt"
         private const val LARGE_MESSAGE_BYTES = 4096
+        private const val OP_TIMEOUT_MS = 10_000L
         const val MAX_MTU = 517
         private val CCCD_ENABLE_NOTIFICATION = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
     }
+
+    /**
+     * Awaits a GATT operation's callback, but fails (retryably) if it never arrives — a misbehaving
+     * peripheral must not park a session forever. Not used for connect(), whose autoConnect waits by
+     * design.
+     */
+    private suspend fun <T> CompletableDeferred<T>.awaitOp(): T =
+        withTimeoutOrNull(OP_TIMEOUT_MS) { await() } ?: throw IOException("GATT operation timed out")
 
     private val _state = MutableStateFlow(ConnectionState.DISCONNECTED)
     val state: StateFlow<ConnectionState> = _state
@@ -243,7 +254,7 @@ internal class SpotflowGattSession(
         pendingDiscover = deferred
         try {
             check(g.discoverServices()) { "discoverServices() rejected" }
-            deferred.await()
+            deferred.awaitOp()
         } finally {
             pendingDiscover = null
         }
@@ -259,7 +270,10 @@ internal class SpotflowGattSession(
                 mtu = FrameCodec.MIN_MTU // fall back; not fatal
                 return
             }
-            deferred.await()
+            // MTU is non-fatal: on timeout fall back to the minimum rather than failing prepare().
+            if (withTimeoutOrNull(OP_TIMEOUT_MS) { deferred.await() } == null) {
+                mtu = FrameCodec.MIN_MTU
+            }
         } finally {
             pendingMtu = null
         }
@@ -284,7 +298,7 @@ internal class SpotflowGattSession(
                     g.writeDescriptor(cccd)
                 }
             }
-            deferred.await()
+            deferred.awaitOp()
         } finally {
             pendingDescriptor = null
         }
@@ -298,7 +312,7 @@ internal class SpotflowGattSession(
         pendingRead = deferred
         try {
             check(g.readCharacteristic(ch)) { "readCharacteristic($uuid) rejected" }
-            deferred.await()
+            deferred.awaitOp()
         } finally {
             pendingRead = null
         }
@@ -331,7 +345,7 @@ internal class SpotflowGattSession(
                     check(g.writeCharacteristic(ch)) { "writeCharacteristic rejected" }
                 }
             }
-            deferred.await()
+            deferred.awaitOp()
         } finally {
             pendingWrite = null
         }

@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import io.spotflow.ble.SpotflowGateway
@@ -33,13 +34,20 @@ class SpotflowGatewayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        val factory = gatewayFactory ?: error("SpotflowGatewayService.gatewayFactory not set")
+        // Enter foreground first to satisfy the startForegroundService contract before any early return.
+        startForegroundCompat(notificationProvider?.invoke(this) ?: buildDefaultNotification())
+
+        val factory = gatewayFactory
+        if (factory == null) {
+            // The process was likely killed and restarted by the system (START_STICKY): the static
+            // factory is gone. Stop gracefully rather than crashing; the host re-creates it on next start.
+            Log.w(TAG, "gatewayFactory not set (process restarted?); stopping self")
+            stopSelf()
+            return
+        }
+
         val instance = factory(this)
         gateway = instance
-
-        val notification = notificationProvider?.invoke(this) ?: buildDefaultNotification()
-        startForegroundCompat(notification)
-
         onReady?.invoke(instance)
     }
 
@@ -78,6 +86,7 @@ class SpotflowGatewayService : Service() {
     }
 
     companion object {
+        private const val TAG = "SpotflowGateway"
         const val CHANNEL_ID = "spotflow_gateway"
         private const val NOTIFICATION_ID = 4711
 
