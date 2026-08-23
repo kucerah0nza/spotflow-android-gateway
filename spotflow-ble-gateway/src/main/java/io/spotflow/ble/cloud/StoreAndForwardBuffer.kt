@@ -69,6 +69,18 @@ internal class StoreAndForwardBuffer(
         // RAM items were already popped in takeNext().
     }
 
+    /**
+     * Moves all in-memory items to the persistent tier — call before tearing a session down so unsent
+     * data survives a reconnect (e.g. the device restarting). Only writes to flash when RAM is non-empty.
+     */
+    fun flushToDisk() = synchronized(lock) {
+        while (ram.isNotEmpty()) {
+            val item = ram.removeFirst()
+            ramTierBytes -= item.payload.size
+            disk.enqueue(item.topic, item.payload)
+        }
+    }
+
     /** Returns an item to the buffer after a failed publish so it will be retried. */
     fun requeue(item: Item) = synchronized(lock) {
         if (item.diskId == null) {

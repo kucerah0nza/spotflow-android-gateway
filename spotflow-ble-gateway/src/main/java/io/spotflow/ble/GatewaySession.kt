@@ -113,8 +113,10 @@ internal class GatewaySession(
                 }
             } finally {
                 uplink.disconnect()
+                // Preserve any unsent data across the reconnect instead of dropping the RAM tier.
+                buffer.flushToDisk()
+                push { it.copy(cloudConnected = false, ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
                 buffer.close()
-                push { it.copy(cloudConnected = false) }
             }
         } finally {
             stateJob.cancel()
@@ -163,6 +165,7 @@ internal class GatewaySession(
                 backoff = INITIAL_BACKOFF_MS
                 push { it.copy(forwarded = it.forwarded + 1, ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
             } catch (c: CancellationException) {
+                buffer.requeue(item) // don't lose the in-flight item on teardown; it gets flushed to disk
                 throw c
             } catch (t: Throwable) {
                 if (uplink.isConnected) {

@@ -90,6 +90,19 @@ class StoreAndForwardBufferTest {
     }
 
     @Test
+    fun `flushToDisk moves RAM items to the persistent tier in order`() {
+        open(ramMaxBytes = 10_000) // everything stays in RAM until we flush
+        buffer.enqueue("t", payload(1))
+        buffer.enqueue("t", payload(2))
+        assertEquals(0L, disk.bytes)
+
+        buffer.flushToDisk()
+
+        assertTrue("data should now be on disk", disk.bytes > 0)
+        assertEquals(listOf(1, 2), drainMarkers())
+    }
+
+    @Test
     fun `remove finalizes a disk item`() {
         open(ramMaxBytes = 40) // tiny, so the second enqueue spills the first to disk
         buffer.enqueue("t", payload(1))
