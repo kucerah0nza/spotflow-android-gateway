@@ -10,8 +10,8 @@ The goal is drop-in integration for hardware vendors who already ship an Android
 smart thermostat): add the library, hand it a connection or let it scan, and their BLE devices show up in
 Spotflow.
 
-> **Download:** prebuilt debug APKs are attached to each [GitHub Release](../../releases) (published
-> automatically on every `v*` tag). Sideload one to try the demo gateway without building.
+> **Download:** each [GitHub Release](../../releases) (published automatically on every `v*` tag) attaches
+> the demo **APK** (sideload to try the gateway) and the library **`.aar`** (drop into an integrating app).
 
 ## Modules
 
@@ -193,9 +193,15 @@ CI (`.github/workflows/ci.yml`) runs the library unit tests on every push and pu
    - toggle **airplane mode** — the buffer grows offline and drains when back online;
    - force a **core dump** — the full dump is delivered.
 
-## Not implemented
+## Design choices & roadmap
 
-- **Application-level ACK/NACK.** The protocol reserves these types, but the Device SDK does not implement
-  acknowledgement and devices do not wait for it, so the gateway doesn't send ACKs.
-- **Publishing the AAR to Maven Central.** The `maven-publish` configuration is in place but no repository
-  is wired up yet.
+- **BLE delivery is best-effort (no application-level ACK) — by design for now.** The framed protocol
+  reserves `ACK`/`NACK`, but the Device SDK neither sets a "needs ack" flag nor waits for one, so sending
+  ACKs from the gateway would be a no-op. Reliable BLE delivery — which mostly matters for core dumps,
+  since notifications can be dropped under load — is a coordinated firmware + gateway change (the firmware
+  would flag messages and retransmit, or use BLE `indicate`), so it's a firmware roadmap item, not gateway
+  work.
+- **Distribution via GitHub Releases; Maven Central deferred.** Each `v*` tag publishes the demo APK and
+  the library `.aar` to a GitHub Release. The `maven-publish` config is in place; publishing to Maven
+  Central is deferred until the library goes public/GA (it needs Sonatype + signing + namespace
+  verification).

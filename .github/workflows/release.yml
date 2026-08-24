@@ -30,16 +30,18 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace
+      - name: Build demo APK and library AAR
+        run: ./gradlew :app:assembleDebug :spotflow-ble-gateway:assembleRelease --stacktrace
 
-      - name: Rename APK for the release
+      - name: Collect release artifacts
         run: |
           mkdir -p dist
           cp app/build/outputs/apk/debug/app-debug.apk "dist/spotflow-gateway-${GITHUB_REF_NAME}.apk"
+          cp spotflow-ble-gateway/build/outputs/aar/spotflow-ble-gateway-release.aar \
+             "dist/spotflow-ble-gateway-${GITHUB_REF_NAME}.aar"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.apk
+          files: dist/*
           generate_release_notes: true
