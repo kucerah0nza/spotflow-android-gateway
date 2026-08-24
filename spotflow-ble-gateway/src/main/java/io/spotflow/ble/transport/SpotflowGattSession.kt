@@ -78,6 +78,7 @@ internal class SpotflowGattSession(
     @Volatile private var pendingRead: CompletableDeferred<ByteArray>? = null
     @Volatile private var pendingWrite: CompletableDeferred<Unit>? = null
     @Volatile private var pendingDescriptor: CompletableDeferred<Unit>? = null
+    @Volatile private var pendingRssi: CompletableDeferred<Int>? = null
 
     private var gatt: BluetoothGatt? = null
     private var txSeq = 0
@@ -163,6 +164,14 @@ internal class SpotflowGattSession(
             }
         }
 
+        override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                pendingRssi?.complete(rssi)
+            } else {
+                pendingRssi?.completeExceptionally(IllegalStateException("readRemoteRssi failed: $status"))
+            }
+        }
+
         // API 33+ notification signature.
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
@@ -207,7 +216,7 @@ internal class SpotflowGattSession(
     }
 
     private fun failAllPending(cause: Throwable) {
-        listOf(pendingConnect, pendingDiscover, pendingRead, pendingWrite, pendingDescriptor)
+        listOf(pendingConnect, pendingDiscover, pendingRead, pendingWrite, pendingDescriptor, pendingRssi)
             .forEach { it?.completeExceptionally(cause) }
         pendingMtu?.complete(FrameCodec.MIN_MTU)
     }
@@ -315,6 +324,20 @@ internal class SpotflowGattSession(
             deferred.awaitOp()
         } finally {
             pendingRead = null
+        }
+    }
+
+    /** Reads the current connection signal strength (RSSI, dBm). */
+    @SuppressLint("MissingPermission")
+    suspend fun readRssi(): Int = opLock.withLock {
+        val g = requireGatt()
+        val deferred = CompletableDeferred<Int>()
+        pendingRssi = deferred
+        try {
+            check(g.readRemoteRssi()) { "readRemoteRssi() rejected" }
+            deferred.awaitOp()
+        } finally {
+            pendingRssi = null
         }
     }
 

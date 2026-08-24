@@ -52,6 +52,8 @@ class ManagedBleConnection(
     override suspend fun readSessionMetadata(): ByteArray =
         session.read(GattProfile.SESSION_METADATA)
 
+    override suspend fun readRssi(): Int = session.readRssi()
+
     override suspend fun sendDesiredConfiguration(payload: ByteArray) =
         session.writeDesiredConfiguration(payload)
 

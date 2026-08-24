@@ -29,6 +29,8 @@ data class GatewayDeviceState(
     val ble: ConnectionState = ConnectionState.DISCONNECTED,
     val cloudConnected: Boolean = false,
     val forwarded: Long = 0,
+    /** Latest BLE signal strength in dBm (higher/closer to 0 is stronger), or null if not yet read. */
+    val rssi: Int? = null,
     /** Bytes buffered in the in-memory tier (normal while briefly offline). */
     val ramBytes: Long = 0,
     /** Bytes spilled to the persistent (flash) tier (only after a longer outage). */
@@ -110,6 +112,16 @@ internal class GatewaySession(
                 // Buffer -> MQTT, owning connect/reconnect so offline just keeps buffering.
                 val drainer = launch { drain(uplink, buffer, drainSignal, ::push) }
 
+                // Periodically sample the BLE signal strength for the UI.
+                val rssiJob = launch {
+                    while (true) {
+                        runCatching { connection.readRssi() }.getOrNull()?.let { rssi ->
+                            push { it.copy(rssi = rssi) }
+                        }
+                        delay(RSSI_INTERVAL_MS)
+                    }
+                }
+
                 try {
                     connection.state.first {
                         it == ConnectionState.DISCONNECTED || it == ConnectionState.FAILED
@@ -117,6 +129,7 @@ internal class GatewaySession(
                 } finally {
                     pump.cancel()
                     drainer.cancel()
+                    rssiJob.cancel()
                 }
             } finally {
                 // NonCancellable so this cleanup runs to completion even when the session is cancelled
@@ -221,5 +234,6 @@ internal class GatewaySession(
         const val MAX_PUBLISH_ATTEMPTS = 5
         const val IDLE_POLL_MS = 15_000L
         const val PUBLISH_TIMEOUT_MS = 20_000L
+        const val RSSI_INTERVAL_MS = 5_000L
     }
 }

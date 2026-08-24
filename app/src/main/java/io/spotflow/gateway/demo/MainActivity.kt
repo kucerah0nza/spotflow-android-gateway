@@ -166,9 +166,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun startGateway() {
         val key = binding.ingestKey.text?.toString()?.trim().orEmpty()
-        val ramMb = binding.bufferRamMb.text?.toString()?.toIntOrNull()?.coerceAtLeast(1)
+        // 0 is allowed for either tier: RAM 0 = spill to flash immediately (minimal crash-loss risk);
+        // flash 0 = RAM-only, no persistence.
+        val ramMb = binding.bufferRamMb.text?.toString()?.toIntOrNull()?.coerceAtLeast(0)
             ?: keyStore.bufferRamMb
-        val flashMb = binding.bufferFlashMb.text?.toString()?.toIntOrNull()?.coerceAtLeast(1)
+        val flashMb = binding.bufferFlashMb.text?.toString()?.toIntOrNull()?.coerceAtLeast(0)
             ?: keyStore.bufferFlashMb
         keyStore.ingestKey = key // persist across restarts
         keyStore.bufferRamMb = ramMb
@@ -253,15 +255,24 @@ class MainActivity : AppCompatActivity() {
             d.cloudConnected && d.ble == ConnectionState.READY -> "●"
             else -> "…"
         }
-        fun line(label: String, value: String) = "    ${"$label:".padEnd(14)}$value"
+        fun line(label: String, value: String) = "    ${"$label:".padEnd(17)}$value"
+        val signal = d.rssi?.let { "$it dBm · ${signalQuality(it)}" } ?: "—"
         return buildString {
             appendLine("$marker ${d.deviceId ?: d.address}")
-            appendLine(line("ble", d.ble.toString()))
-            appendLine(line("cloud", cloud))
-            appendLine(line("fwd", "${d.forwarded} msgs"))
-            appendLine(line("buffer_ram", humanBytes(d.ramBytes)))
-            append(line("buffer_flash", humanBytes(d.diskBytes)))
+            appendLine(line("BLE device", d.ble.toString()))
+            appendLine(line("Signal", signal))
+            appendLine(line("MQTT connection", cloud))
+            appendLine(line("Forwarded", "${d.forwarded} msgs"))
+            appendLine(line("Buffer RAM", humanBytes(d.ramBytes)))
+            append(line("Buffer flash", humanBytes(d.diskBytes)))
         }
+    }
+
+    private fun signalQuality(rssi: Int): String = when {
+        rssi >= -60 -> "strong"
+        rssi >= -75 -> "good"
+        rssi >= -85 -> "weak"
+        else -> "very weak"
     }
 
     private fun humanBytes(bytes: Long): String = when {

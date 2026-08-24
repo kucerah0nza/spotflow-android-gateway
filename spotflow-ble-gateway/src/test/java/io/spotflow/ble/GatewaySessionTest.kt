@@ -154,6 +154,7 @@ private class FakeBleConnection : BleConnection {
     override suspend fun prepare() { stateFlow.value = ConnectionState.READY }
     override suspend fun readDeviceId() = "test-device"
     override suspend fun readSessionMetadata() = "meta".toByteArray()
+    override suspend fun readRssi() = -55
     override suspend fun sendDesiredConfiguration(payload: ByteArray) { sentDesiredConfig += payload }
     override suspend fun close() {}
 

@@ -57,6 +57,9 @@ interface BleConnection {
     /** Reads the CBOR session-metadata characteristic. */
     suspend fun readSessionMetadata(): ByteArray
 
+    /** Reads the current connection signal strength (RSSI, in dBm). */
+    suspend fun readRssi(): Int
+
     /** Fragments and writes a DESIRED_CONFIGURATION payload to the RX Stream. */
     suspend fun sendDesiredConfiguration(payload: ByteArray)
 
