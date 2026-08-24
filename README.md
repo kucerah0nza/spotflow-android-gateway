@@ -30,7 +30,7 @@ flowchart LR
         direction TB
         S["SpotflowGattSession<br/>serialized GATT queue"]
         F["FrameCodec<br/>reassemble fragments"]
-        B[("PersistentMessageQueue<br/>disk buffer, byte-bounded")]
+        B[("StoreAndForwardBuffer<br/>RAM tier → flash tier<br/>(byte-bounded, FIFO)")]
         U["MqttUplink"]
         S --> F --> B --> U
     end
@@ -43,9 +43,9 @@ flowchart LR
     U -- "RX Stream 0006<br/>write no-response" --> D
 ```
 
-Received BLE messages are reassembled and **persisted to an on-disk buffer**, then a drainer publishes
-them to MQTT when the network is available — so data survives outages, and BLE ingestion never blocks on
-the network.
+Received BLE messages are reassembled and **buffered RAM-first** (spilling to a flash tier only during
+longer outages), then a drainer publishes them to MQTT when the network is available — so data survives
+outages, the flash isn't worn in steady state, and BLE ingestion never blocks on the network.
 
 ### Protocol
 
@@ -70,7 +70,8 @@ the network.
 - `transport/` — `BleConnection` (with `ManagedBleConnection` / `AttachedBleConnection`),
   `SpotflowGattSession` (serialized GATT command queue + callback bridge), `SpotflowScanner`.
 - `cloud/` — `MqttUplink`, `MqttConfig` / `SpotflowTopics`, `CredentialsProvider` + `StaticIngestKey`,
-  `PersistentMessageQueue` (store-and-forward buffer), `MqttAuthException` / `MqttConnectException`.
+  `StoreAndForwardBuffer` (the two-tier RAM+flash buffer) backed by `PersistentMessageQueue` (its SQLite
+  flash tier), `MqttAuthException` / `MqttConnectException`.
 - `SpotflowGateway`, `GatewaySession` — orchestration.
 - `service/SpotflowGatewayService` — foreground service (`connectedDevice`).
 
@@ -115,10 +116,10 @@ dedicated always-on gateway, also guide users to disable battery optimization (D
 
 ```mermaid
 flowchart TD
-    A["BLE message received"] --> B["reassemble + enqueue to disk buffer"]
+    A["BLE message received"] --> B["reassemble → enqueue to RAM tier"]
     B --> C{"network<br/>available?"}
     C -- "yes" --> D["publish to MQTT (QoS 1) · remove from buffer"]
-    C -- "no" --> E["keep buffering<br/>(evict oldest when full)"]
+    C -- "no" --> E["keep buffering in RAM;<br/>spill oldest to flash when RAM fills<br/>(evict oldest when flash is full)"]
     E --> C
 ```
 
@@ -128,7 +129,7 @@ flowchart TD
   status stays connected rather than only reconnecting when the next message arrives.
 - **Store-and-forward buffer** — a two-tier buffer keeps diagnostics flowing through outages without
   wearing the flash. In steady state messages flow through a small **RAM tier only** (no disk writes);
-  once the RAM tier fills (`ramBufferMaxBytes`, default 2 MiB — i.e. the network has been down a while) the
+  once the RAM tier fills (`ramBufferMaxBytes`, default 1 MiB — i.e. the network has been down a while) the
   oldest messages **spill to a crash-safe, byte-bounded per-device SQLite tier** that survives the app
   being killed or the phone rebooting. Total size is bounded by `bufferMaxBytes` (default 50 MiB),
   evict-oldest when full, and everything drains in FIFO order once connectivity returns. Trade-off: data
@@ -148,8 +149,8 @@ val gateway = SpotflowGateway(
     context,
     credentials = StaticIngestKey(key),   // or implement CredentialsProvider for rotation / per-device keys
     mqttConfig = MqttConfig(
-        bufferMaxBytes = 50L * 1024 * 1024,     // total store-and-forward buffer (RAM + disk)
-        ramBufferMaxBytes = 2L * 1024 * 1024,   // RAM tier; spills to disk only past this
+        bufferMaxBytes = 50L * 1024 * 1024,     // total store-and-forward buffer (RAM + flash)
+        ramBufferMaxBytes = 1L * 1024 * 1024,   // RAM tier; spills to flash only past this
         // host / port / qos / topics are configurable; defaults target production
     ),
 )
