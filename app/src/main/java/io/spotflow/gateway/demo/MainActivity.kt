@@ -256,7 +256,10 @@ class MainActivity : AppCompatActivity() {
             else -> "…"
         }
         fun line(label: String, value: String) = "    ${"$label:".padEnd(17)}$value"
-        val signal = d.rssi?.let { "$it dBm · ${signalQuality(it)}" } ?: "—"
+        // Only show a live signal reading while actually connected — otherwise it would keep
+        // displaying the last RSSI next to "DISCONNECTED", which reads as contradictory.
+        val signal = d.rssi?.takeIf { d.ble == ConnectionState.READY }
+            ?.let { "$it dBm · ${signalQuality(it)}" } ?: "—"
         return buildString {
             appendLine("$marker ${d.deviceId ?: d.address}")
             appendLine(line("BLE device", d.ble.toString()))
