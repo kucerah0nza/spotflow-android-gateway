@@ -11,13 +11,29 @@ android {
         applicationId = "io.spotflow.gateway.demo"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
+    }
+
+    signingConfigs {
+        // A stable, shared signing key committed to the repo so every build — local and CI — produces
+        // consistently-signed, updatable APKs. This is a development key (its password is not secret); a
+        // real production/Play signing key would live in CI secrets instead.
+        create("shared") {
+            storeFile = file("signing/spotflow-shared.keystore")
+            storePassword = "spotflow"
+            keyAlias = "spotflow"
+            keyPassword = "spotflow"
+        }
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("shared")
+        }
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("shared")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
