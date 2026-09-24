@@ -10,6 +10,11 @@ jobs:
   build:
     name: Test & build APK
     runs-on: ubuntu-latest
+    env:
+      SPOTFLOW_KEYSTORE_BASE64: ${{ secrets.SPOTFLOW_KEYSTORE_BASE64 }}
+      SPOTFLOW_KEYSTORE_PASSWORD: ${{ secrets.SPOTFLOW_KEYSTORE_PASSWORD }}
+      SPOTFLOW_KEY_ALIAS: ${{ secrets.SPOTFLOW_KEY_ALIAS }}
+      SPOTFLOW_KEY_PASSWORD: ${{ secrets.SPOTFLOW_KEY_PASSWORD }}
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -33,6 +38,12 @@ jobs:
 
       - name: Lint
         run: ./gradlew :spotflow-ble-gateway:lintDebug :app:lintDebug --stacktrace
+
+      - name: Set up signing key
+        if: env.SPOTFLOW_KEYSTORE_BASE64 != ''
+        run: |
+          echo "$SPOTFLOW_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/spotflow.keystore"
+          echo "SPOTFLOW_KEYSTORE_FILE=$RUNNER_TEMP/spotflow.keystore" >> "$GITHUB_ENV"
 
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --stacktrace
