@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.os.Build
 import android.util.Log
 import io.spotflow.ble.protocol.FrameCodec
@@ -228,12 +229,13 @@ internal class SpotflowGattSession(
      * `BluetoothGatt` from `device.connectGatt(...)`. The pending slot is armed before [open] runs so
      * the connection callback can never be missed.
      */
-    suspend fun connect(open: (BluetoothGattCallback) -> BluetoothGatt) {
+    suspend fun connect(open: (BluetoothGattCallback) -> BluetoothGatt?) {
         val deferred = CompletableDeferred<Unit>()
         pendingConnect = deferred
         _state.value = ConnectionState.CONNECTING
-        attachGatt(open(callback))
         try {
+            // connectGatt returns null e.g. when Bluetooth was turned off in the meantime.
+            attachGatt(open(callback) ?: throw IllegalStateException("connectGatt() returned null"))
             deferred.await()
         } catch (t: Throwable) {
             // On failure or cancellation, release the GATT so any pending autoConnect attempt stops.
@@ -299,12 +301,13 @@ internal class SpotflowGattSession(
         pendingDescriptor = deferred
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                g.writeDescriptor(cccd, CCCD_ENABLE_NOTIFICATION)
+                val status = g.writeDescriptor(cccd, CCCD_ENABLE_NOTIFICATION)
+                check(status == BluetoothStatusCodes.SUCCESS) { "writeDescriptor rejected: $status" }
             } else {
                 @Suppress("DEPRECATION")
                 run {
                     cccd.value = CCCD_ENABLE_NOTIFICATION
-                    g.writeDescriptor(cccd)
+                    check(g.writeDescriptor(cccd)) { "writeDescriptor rejected" }
                 }
             }
             deferred.awaitOp()
@@ -359,7 +362,7 @@ internal class SpotflowGattSession(
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 val status = g.writeCharacteristic(ch, value, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
-                check(status == BluetoothGatt.GATT_SUCCESS) { "writeCharacteristic rejected: $status" }
+                check(status == BluetoothStatusCodes.SUCCESS) { "writeCharacteristic rejected: $status" }
             } else {
                 @Suppress("DEPRECATION")
                 run {
@@ -373,6 +376,12 @@ internal class SpotflowGattSession(
             pendingWrite = null
         }
     }
+
+    /**
+     * Runs [block] holding the GATT operation lock, so operations issued by the host inside it cannot
+     * overlap with the gateway's own (attach mode).
+     */
+    suspend fun <T> exclusive(block: suspend () -> T): T = opLock.withLock { block() }
 
     @SuppressLint("MissingPermission")
     fun disconnectAndClose() {

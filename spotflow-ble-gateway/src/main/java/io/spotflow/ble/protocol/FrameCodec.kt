@@ -18,7 +18,7 @@ import java.io.ByteArrayOutputStream
  * how the [Reassembler] groups fragments. Flags mark the first and last fragment.
  *
  * NOTE: the exact numeric flag bit values below are not published in the Spotflow docs and must be
- * verified against the Device SDK before interop testing (see README "Open items").
+ * verified against the Device SDK before interop testing.
  */
 object FrameCodec {
 
@@ -95,19 +95,24 @@ object FrameCodec {
     /**
      * Reassembles inbound fragments (from TX Stream notifications) into complete [Message]s.
      *
-     * Not thread-safe: feed all fragments from a single connection on one dispatcher. A malformed or
-     * orphaned fragment is dropped (returns null) rather than throwing, so one bad notification cannot
-     * tear down the stream.
+     * A malformed, orphaned, or incomplete fragment sequence is dropped (returns null) rather than
+     * throwing, so one bad notification cannot tear down the stream. A message is only delivered if its
+     * reassembled size matches the length declared in its first fragment — a lost fragment must not turn
+     * into a silently truncated (corrupt) payload being forwarded to the cloud. Memory is bounded: a
+     * partial never grows past its declared length, and at most [MAX_PARTIALS] messages are in flight.
      */
     class Reassembler {
 
         private data class Key(val type: Int, val seq: Int)
 
         private class Partial(val expectedLength: Int) {
-            val buffer = ByteArrayOutputStream()
+            val buffer = ByteArrayOutputStream(expectedLength)
         }
 
-        private val partials = HashMap<Key, Partial>()
+        // Insertion-ordered so the oldest in-flight partial is evicted first when over the cap.
+        private val partials = object : LinkedHashMap<Key, Partial>() {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Key, Partial>) = size > MAX_PARTIALS
+        }
 
         /**
          * Feeds one raw notification frame. Returns a [Message] when a message completes, else null.
@@ -139,22 +144,30 @@ object FrameCodec {
                 dataStart = HEADER_CONTINUATION
             }
 
-            partial.buffer.write(raw, dataStart, raw.size - dataStart)
+            val chunk = raw.size - dataStart
+            if (partial.buffer.size() + chunk > partial.expectedLength) {
+                // More data than the first fragment declared: a corrupt or hostile stream. Drop it
+                // rather than buffering without bound.
+                partials.remove(key)
+                return null
+            }
+            partial.buffer.write(raw, dataStart, chunk)
 
             if (!isLast) return null
 
             partials.remove(key)
-            var bytes = partial.buffer.toByteArray()
-            // Trust IS_LAST for completion; use the declared length only to trim an overrun.
-            if (bytes.size > partial.expectedLength) {
-                bytes = bytes.copyOf(partial.expectedLength)
-            }
+            if (partial.buffer.size() != partial.expectedLength) return null // a fragment was lost
             val type = MessageType.fromValue(rawType) ?: return null // unknown type: drop
-            return Message(type, bytes)
+            return Message(type, partial.buffer.toByteArray())
         }
 
         /** Drops any in-flight partial messages (e.g. after a disconnect). */
         @Synchronized
         fun reset() = partials.clear()
+
+        private companion object {
+            /** Max messages reassembled concurrently; a well-behaved device interleaves very few. */
+            const val MAX_PARTIALS = 8
+        }
     }
 }

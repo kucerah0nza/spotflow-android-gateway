@@ -14,8 +14,8 @@ import kotlinx.coroutines.flow.StateFlow
  * The host retains ownership of connect/disconnect and MUST:
  *  1. Forward its `BluetoothGattCallback` events to [gattCallback] (use it directly as the connectGatt
  *     callback, or fan out to it from the host's own callback), and
- *  2. Not issue competing GATT operations while a Spotflow session is active (the Android stack allows
- *     only one outstanding GATT operation at a time).
+ *  2. Run its own GATT operations through [runExclusive] while attached (the Android stack allows only
+ *     one outstanding GATT operation at a time, so unsynchronized operations would collide).
  *
  * [prepare] assumes the GATT is already connected; it discovers services, negotiates MTU, and enables
  * TX notifications. [close] detaches without disconnecting the host's GATT.
@@ -49,4 +49,11 @@ class AttachedBleConnection(
         session.writeDesiredConfiguration(payload)
 
     override suspend fun close() = session.detach()
+
+    /**
+     * Runs [block] while holding the GATT operation queue, so the host's own operations (issued on
+     * [gatt] inside [block], awaiting their own callbacks) never overlap with the gateway's. Keep blocks
+     * short: gateway operations — e.g. writing desired configuration — wait meanwhile.
+     */
+    suspend fun <T> runExclusive(block: suspend (BluetoothGatt) -> T): T = session.exclusive { block(gatt) }
 }

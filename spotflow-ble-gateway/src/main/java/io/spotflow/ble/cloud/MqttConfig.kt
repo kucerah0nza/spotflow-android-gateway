@@ -4,7 +4,7 @@ import com.hivemq.client.mqtt.datatypes.MqttQos
 
 /**
  * MQTT topic names on the Spotflow broker. Kept configurable because whether these are literal or
- * device-ID-templated is still being confirmed with the Spotflow backend (see README "Open items").
+ * device-ID-templated is still being confirmed with the Spotflow backend.
  */
 data class SpotflowTopics(
     val ingest: String = "ingest-cbor",
@@ -26,7 +26,8 @@ data class MqttConfig(
     /**
      * Max total size of the store-and-forward buffer per device, in bytes (RAM tier + disk tier).
      * Messages received over BLE are buffered here and drained to MQTT when the network is available;
-     * when the buffer is full the oldest messages are evicted. Default 50 MiB.
+     * when the buffer is full the oldest messages are evicted. Default 50 MiB. If this is not larger than
+     * [ramBufferMaxBytes] there is no flash tier: the buffer is RAM-only and never writes to flash.
      */
     val bufferMaxBytes: Long = 50L * 1024 * 1024,
 
