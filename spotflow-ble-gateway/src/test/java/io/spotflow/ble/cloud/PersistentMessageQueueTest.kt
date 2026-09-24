@@ -92,6 +92,43 @@ class PersistentMessageQueueTest {
     }
 
     @Test
+    fun `batch enqueue and row count include zero-length payloads`() {
+        open(maxBytes = 10_000)
+        queue.enqueueAll(listOf(PersistentMessageQueue.Entry(1, "t", ByteArray(0)), PersistentMessageQueue.Entry(2, "t", ByteArray(3))))
+        assertEquals(3L, queue.bytes)
+        queue.remove(2)
+        assertEquals(0L, queue.bytes)
+        assertEquals(false, queue.isEmpty)
+        queue.remove(1)
+        assertEquals(true, queue.isEmpty)
+    }
+
+    @Test
+    fun `upgrading a v2 database keeps buffered data`() {
+        context.getDatabasePath("spotflow_buffer_dev.db").also { it.parentFile?.mkdirs() }
+        android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(context.getDatabasePath("spotflow_buffer_dev.db"), null).use { db ->
+            db.execSQL("CREATE TABLE q (seq INTEGER PRIMARY KEY, topic TEXT NOT NULL, payload BLOB NOT NULL, len INTEGER NOT NULL)")
+            db.execSQL("INSERT INTO q VALUES (5, 't', x'0102', 2)")
+            db.version = 2
+        }
+        open(maxBytes = 10_000)
+        assertEquals(5L, queue.peek()!!.seq)
+        assertEquals(2L, queue.bytes)
+        assertEquals(listOf("dev"), PersistentMessageQueue.storedDeviceIds(context))
+    }
+
+    @Test
+    fun `distinct device ids never share a file`() {
+        val a = PersistentMessageQueue.databaseName("a.b")
+        val b = PersistentMessageQueue.databaseName("a_b")
+        assertEquals("spotflow_buffer_a_b.db", b)
+        assertEquals(false, a == b)
+        val long1 = PersistentMessageQueue.databaseName("x".repeat(70) + "1")
+        val long2 = PersistentMessageQueue.databaseName("x".repeat(70) + "2")
+        assertEquals(false, long1 == long2)
+    }
+
+    @Test
     fun `peek on empty queue returns null`() {
         open(maxBytes = 10_000)
         assertNull(queue.peek())

@@ -7,6 +7,7 @@ import android.content.Context
 import io.spotflow.ble.protocol.GattProfile
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * A [BleConnection] the library fully owns: it opens the GATT connection to [device], negotiates the
@@ -15,7 +16,7 @@ import kotlinx.coroutines.flow.StateFlow
  * Discovery of the [device] (scanning for [GattProfile.SERVICE]) is handled by [SpotflowScanner].
  */
 class ManagedBleConnection(
-    private val context: Context,
+    context: Context,
     private val device: BluetoothDevice,
     requestedMtu: Int = SpotflowGattSession.MAX_MTU,
     /**
@@ -24,7 +25,15 @@ class ManagedBleConnection(
      * choice for reconnecting to a known device that may currently be down.
      */
     private val autoConnect: Boolean = false,
+    /**
+     * With [autoConnect], how long to wait for the device to reappear before giving up with
+     * [DeviceUnreachableException] — so a device that is gone for good doesn't hold one of Android's
+     * limited GATT client slots forever. `0` waits indefinitely.
+     */
+    private val autoConnectTimeoutMs: Long = DEFAULT_AUTO_CONNECT_TIMEOUT_MS,
 ) : BleConnection {
+
+    private val context = context.applicationContext
 
     private val session = SpotflowGattSession(requestedMtu)
 
@@ -40,8 +49,16 @@ class ManagedBleConnection(
         // retry loop backs off and reconnects once Bluetooth is back on.
         val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
         check(adapter?.isEnabled == true) { "Bluetooth is off" }
-        session.connect { callback ->
-            device.connectGatt(context, autoConnect, callback, BluetoothDevice.TRANSPORT_LE)
+        val connect = suspend {
+            session.connect { callback ->
+                device.connectGatt(context, autoConnect, callback, BluetoothDevice.TRANSPORT_LE)
+            }
+        }
+        if (autoConnect && autoConnectTimeoutMs > 0) {
+            withTimeoutOrNull(autoConnectTimeoutMs) { connect() }
+                ?: throw DeviceUnreachableException("not seen for ${autoConnectTimeoutMs / 1000}s")
+        } else {
+            connect()
         }
         session.prepare()
     }
@@ -58,4 +75,11 @@ class ManagedBleConnection(
         session.writeDesiredConfiguration(payload)
 
     override suspend fun close() = session.disconnectAndClose()
+
+    companion object {
+        const val DEFAULT_AUTO_CONNECT_TIMEOUT_MS = 10 * 60 * 1000L
+    }
 }
+
+/** A managed device did not reappear within its auto-connect timeout. */
+class DeviceUnreachableException(message: String) : Exception(message)

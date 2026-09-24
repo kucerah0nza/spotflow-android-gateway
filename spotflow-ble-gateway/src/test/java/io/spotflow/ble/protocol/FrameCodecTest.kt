@@ -130,6 +130,43 @@ class FrameCodecTest {
     }
 
     @Test
+    fun `lost middle fragment drops the message instead of truncating it`() {
+        val payload = Random(1).nextBytes(200)
+        val frames = FrameCodec.fragment(MessageType.TELEMETRY, payload, seq = 1, mtu = 40)
+        val reassembler = FrameCodec.Reassembler()
+        frames.forEachIndexed { i, f ->
+            if (i != 2) assertNull(reassembler.onFragment(f))
+        }
+    }
+
+    @Test
+    fun `fragments beyond the declared length are dropped`() {
+        val reassembler = FrameCodec.Reassembler()
+        val first = byteArrayOf(MessageType.TELEMETRY.value.toByte(), FrameCodec.FLAG_IS_FIRST.toByte(), 1, 4, 0, 1, 2)
+        val overrun = byteArrayOf(MessageType.TELEMETRY.value.toByte(), 0, 1, 3, 4, 5, 6)
+        val last = byteArrayOf(MessageType.TELEMETRY.value.toByte(), FrameCodec.FLAG_IS_LAST.toByte(), 1, 3)
+        assertNull(reassembler.onFragment(first))
+        assertNull(reassembler.onFragment(overrun)) // 2 + 4 > 4 declared: the message is discarded
+        assertNull(reassembler.onFragment(last)) // nothing left to complete
+    }
+
+    @Test
+    fun `in-flight partials are capped`() {
+        val reassembler = FrameCodec.Reassembler()
+        val firsts = (0 until 20).map { seq ->
+            FrameCodec.fragment(MessageType.TELEMETRY, ByteArray(100) { seq.toByte() }, seq = seq, mtu = 40)
+        }
+        firsts.forEach { reassembler.onFragment(it.first()) }
+        // The newest partial still completes; the oldest was evicted.
+        val newest = firsts.last()
+        var out: Message? = null
+        newest.drop(1).forEach { out = reassembler.onFragment(it) ?: out }
+        assertEquals(100, out?.payload?.size)
+        val oldest = firsts.first()
+        oldest.drop(1).forEach { assertNull(reassembler.onFragment(it)) }
+    }
+
+    @Test
     fun `reset drops in-flight partials`() {
         val reassembler = FrameCodec.Reassembler()
         val frames = FrameCodec.fragment(MessageType.TELEMETRY, Random(3).nextBytes(200), seq = 4, mtu = 30)

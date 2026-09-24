@@ -47,6 +47,12 @@ Received BLE messages are reassembled and **buffered RAM-first** (spilling to a 
 longer outages), then a drainer publishes them to MQTT when the network is available — so data survives
 outages, the flash isn't worn in steady state, and BLE ingestion never blocks on the network.
 
+The cloud side of each device (its buffer, MQTT connection and drainer — `CloudLink`) is independent of
+the BLE connection: when a device disconnects, its link keeps uploading whatever is still buffered and
+then closes; if the device reconnects meanwhile, the new session takes over the still-connected link.
+Buffers left on disk by an earlier run are uploaded as soon as the gateway is created, even if those
+devices never come back.
+
 ### Protocol
 
 - **GATT** service `26530001-81E5-4861-82AE-2C92E6887922`, characteristics: Capabilities (`0002`),
@@ -62,7 +68,10 @@ outages, the flash isn't worn in steady state, and BLE ingestion never blocks on
   `username = device ID` and `password = ingest key`. TLS is validated by the Android system trust store
   (Let's Encrypt ISRG Root X1 — no bundled CA). Telemetry and session metadata publish to `ingest-cbor`,
   reported configuration to `config-cbor-d2c`; desired configuration is received from `config-cbor-c2d`
-  and written down the RX Stream.
+  and written down the RX Stream, in order, and acknowledged to the broker only once written.
+- **Delivery** is at-least-once: a publish that timed out or was cut off by a disconnect may arrive twice.
+- **Reassembly** only delivers a message whose size matches the length declared in its first fragment;
+  a message with a lost fragment is dropped rather than forwarded truncated.
 
 ### Package layout (`spotflow-ble-gateway/src/main/java/io/spotflow/ble`)
 
@@ -72,7 +81,8 @@ outages, the flash isn't worn in steady state, and BLE ingestion never blocks on
 - `cloud/` — `MqttUplink`, `MqttConfig` / `SpotflowTopics`, `CredentialsProvider` + `StaticIngestKey`,
   `StoreAndForwardBuffer` (the two-tier RAM+flash buffer) backed by `PersistentMessageQueue` (its SQLite
   flash tier), `MqttAuthException` / `MqttConnectException`.
-- `SpotflowGateway`, `GatewaySession` — orchestration.
+- `SpotflowGateway`, `GatewaySession` (BLE side), `CloudLink` / `CloudLinkRegistry` (per-device cloud
+  side that outlives BLE sessions), `DeviceFilter` — orchestration.
 - `service/SpotflowGatewayService` — foreground service (`connectedDevice`).
 
 ## Quick start
@@ -80,9 +90,19 @@ outages, the flash isn't worn in steady state, and BLE ingestion never blocks on
 ### Managed mode (library owns the connection)
 
 ```kotlin
-val gateway = SpotflowGateway(context, StaticIngestKey("<ingest-key>"))
+val gateway = SpotflowGateway(
+    context,
+    StaticIngestKey("<ingest-key>"),
+    deviceFilter = { address, deviceId -> deviceId in myProvisionedDevices },
+)
 gateway.startScanning() // scans for the Spotflow service, connects, relays, reconnects
 ```
+
+> **Security — set a `deviceFilter`.** Managed mode connects to anything that advertises the Spotflow
+> service, and the BLE protocol does not authenticate devices. Without a filter, any nearby peripheral
+> could publish data under any device ID in your workspace (using your ingest key) and receive that
+> device's desired configuration. The gateway also refuses a second live session for a device ID that is
+> already connected, and never relays a device with an empty ID.
 
 ### Attach mode (host already owns the connection)
 
@@ -95,8 +115,10 @@ val connection = gateway.attach(existingGatt)
 **Host contract for attach mode:**
 1. Forward your `BluetoothGattCallback` events to `connection.gattCallback` (use it directly as your
    `connectGatt` callback, or fan out to it from your own callback).
-2. Do **not** issue competing GATT operations while a Spotflow session is active — the Android BLE stack
-   allows only one outstanding GATT operation at a time.
+2. Run your own GATT operations inside `connection.runExclusive { gatt -> ... }` while attached — the
+   Android BLE stack allows only one outstanding GATT operation at a time, and this serializes yours with
+   the gateway's. The gateway doesn't poll RSSI on an attached connection unless you pass
+   `attach(gatt, pollRssi = true)`.
 3. The host owns connect/disconnect and reconnection; `close()` only detaches.
 
 ### Background operation (screen off)
@@ -112,6 +134,11 @@ SpotflowGatewayService.start(context)
 It runs as foreground service type `connectedDevice` with a persistent (customizable) notification. For a
 dedicated always-on gateway, also guide users to disable battery optimization (Doze) for the app.
 
+The service is `START_STICKY`, so Android recreates it after killing the process — but in a fresh process
+the static `gatewayFactory` / `onReady` hooks are unset. **Set them from `Application.onCreate()`**
+whenever the gateway should be running (the demo's `GatewayApp` does this from a persisted flag);
+otherwise the restarted service stops itself and relaying ends until the app is opened again.
+
 ## Resilience
 
 ```mermaid
@@ -124,16 +151,21 @@ flowchart TD
 ```
 
 - **Reconnect** — a dropped BLE link is reconnected automatically (a direct connect first, then
-  `autoConnect` so Android re-attaches the moment a known device reappears, with exponential backoff). The
-  MQTT uplink reconnects on its own too, and the drainer keeps the link warm during idle periods so the
-  status stays connected rather than only reconnecting when the next message arrives.
+  `autoConnect` so Android re-attaches the moment a known device reappears, with exponential backoff). A
+  device that stays away for 10 minutes is released (freeing one of Android's limited GATT client slots)
+  and picked up again by the scanner when it reappears. The MQTT uplink reconnects on its own too, and the
+  drainer keeps the link warm during idle periods so the status stays connected rather than only
+  reconnecting when the next message arrives.
 - **Store-and-forward buffer** — a two-tier buffer keeps diagnostics flowing through outages without
   wearing the flash. In steady state messages flow through a small **RAM tier only** (no disk writes);
   once the RAM tier fills (`ramBufferMaxBytes`, default 1 MiB — i.e. the network has been down a while) the
   oldest messages **spill to a crash-safe, byte-bounded per-device SQLite tier** that survives the app
-  being killed or the phone rebooting. Total size is bounded by `bufferMaxBytes` (default 50 MiB),
-  evict-oldest when full, and everything drains in FIFO order once connectivity returns. Trade-off: data
-  still in the RAM tier is lost if the process is killed.
+  being killed or the phone rebooting. Spills are written in batches (one transaction each), so an
+  outage costs occasional flash writes rather than one per message. Total size is bounded by
+  `bufferMaxBytes` (default 50 MiB), evict-oldest when full, and everything drains in FIFO order once
+  connectivity returns — whether or not the device is still connected. With `bufferMaxBytes` ≤
+  `ramBufferMaxBytes` there is no flash tier at all (RAM-only). Trade-off: data still in the RAM tier is
+  lost if the process is killed.
 - **Bluetooth off/on** — the gateway watches the Bluetooth adapter itself, so turning Bluetooth off and
   back on tears down and re-establishes sessions automatically — even with the screen off, since it runs in
   the foreground service. (Turning Bluetooth off often doesn't deliver a GATT disconnect callback, which
@@ -141,6 +173,8 @@ flowchart TD
   before starting and shows a tappable banner if it's turned off while running.
 - **Cloud errors** — a rejected ingest key surfaces the broker's CONNACK reason (e.g.
   `BAD_USER_NAME_OR_PASSWORD`) as `MqttAuthException` and stops retrying instead of hammering the broker.
+  A message the broker keeps rejecting (a "poison" message) is dropped after a few attempts — also when
+  the broker reacts by disconnecting — so it can't block the rest of the buffer.
 
 ## Configuration
 
@@ -175,7 +209,7 @@ Requires **JDK 17** and the **Android SDK** (`compileSdk 35`, `minSdk 26`). Poin
 `local.properties` with `sdk.dir=/path/to/Android/sdk` (or the `ANDROID_HOME` env var).
 
 ```bash
-./gradlew :spotflow-ble-gateway:testDebugUnitTest   # run FrameCodec unit tests (no device needed)
+./gradlew :spotflow-ble-gateway:testDebugUnitTest   # run the library unit tests (no device needed)
 ./gradlew :spotflow-ble-gateway:assembleRelease     # build the AAR
 ./gradlew :app:assembleDebug                        # build the demo app
 ```
@@ -185,7 +219,11 @@ CI (`.github/workflows/ci.yml`) runs the library unit tests on every push and pu
 ## Testing
 
 1. **Unit (no hardware):** `FrameCodecTest` covers fragmentation/reassembly incl. the 23-byte MTU,
-   multi-fragment messages, and malformed input.
+   multi-fragment messages, and malformed or incomplete input; `PersistentMessageQueueTest` and
+   `StoreAndForwardBufferTest` cover the two-tier buffer (FIFO across tiers, eviction, schema upgrade,
+   RAM-only mode); `GatewaySessionTest` covers the orchestration against fake BLE/MQTT (offline buffering,
+   uploading after disconnect, link hand-over, device filter, poison messages, desired configuration,
+   recovering buffers from an earlier run).
 2. **On device:** flash the Device SDK BLE sample onto a supported board (e.g. ESP32-C3/C6, Silicon Labs
    EFR32), install the demo app, enter an ingest key and tap **Start**. Verify diagnostics arrive in the
    Spotflow cloud, then exercise the resilience paths:

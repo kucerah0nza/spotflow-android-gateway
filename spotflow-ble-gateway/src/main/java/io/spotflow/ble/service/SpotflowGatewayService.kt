@@ -25,6 +25,11 @@ import io.spotflow.ble.SpotflowGateway
  * SpotflowGatewayService.onReady = { gateway -> gateway.startScanning() }
  * SpotflowGatewayService.start(context)
  * ```
+ * The service is `START_STICKY`: if Android kills the process, it recreates the service later — in a
+ * fresh process where these static hooks are unset. To keep relaying across such restarts, set
+ * [gatewayFactory] and [onReady] from `Application.onCreate()` (which runs first in the new process)
+ * whenever the gateway should be running; otherwise the restarted service just stops itself.
+ *
  * Host apps that already run their own foreground service (e.g. in attach mode) can skip this class and
  * hold a [SpotflowGateway] directly.
  */
@@ -35,7 +40,15 @@ class SpotflowGatewayService : Service() {
     override fun onCreate() {
         super.onCreate()
         // Enter foreground first to satisfy the startForegroundService contract before any early return.
-        startForegroundCompat(notificationProvider?.invoke(this) ?: buildDefaultNotification())
+        try {
+            startForegroundCompat(notificationProvider?.invoke(this) ?: buildDefaultNotification())
+        } catch (e: RuntimeException) {
+            // e.g. Android 14+ refuses a connectedDevice service once Bluetooth permissions were revoked
+            // (possible on a START_STICKY restart). Stop instead of crashing the host app.
+            Log.w(TAG, "cannot enter foreground: ${e.message}; stopping self")
+            stopSelf()
+            return
+        }
 
         val factory = gatewayFactory
         if (factory == null) {
@@ -94,7 +107,10 @@ class SpotflowGatewayService : Service() {
         @Volatile
         var gatewayFactory: ((Context) -> SpotflowGateway)? = null
 
-        /** Optional custom foreground notification (branding). Falls back to a default. */
+        /**
+         * Optional custom foreground notification (branding). Falls back to a default. The provider must
+         * create its own notification channel.
+         */
         @Volatile
         var notificationProvider: ((Context) -> Notification)? = null
 

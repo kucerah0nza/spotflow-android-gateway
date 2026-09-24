@@ -57,15 +57,57 @@ class StoreAndForwardBufferTest {
     }
 
     @Test
-    fun `spills oldest to disk over the cap`() {
+    fun `spills oldest to disk in one batch down to half the cap`() {
         open(ramMaxBytes = 100)
         buffer.enqueue("t", payload(1))
         buffer.enqueue("t", payload(2))
-        buffer.enqueue("t", payload(3)) // 120 > 100 -> spill marker 1 to disk
+        buffer.enqueue("t", payload(3)) // 120 > 100 -> spill markers 1 and 2 (down to <= 50 in RAM)
 
-        assertEquals(40L, disk.bytes)
+        assertEquals(80L, disk.bytes)
+        assertEquals(40L, buffer.ramBytes)
         assertEquals(120L, buffer.bytes)
         assertEquals("disk (oldest) drained first", 1, buffer.takeNext()!!.payload[0].toInt())
+    }
+
+    @Test
+    fun `failed disk write cannot wedge the drain`() {
+        open(ramMaxBytes = 1_000)
+        // A duplicate seq is ignored rather than counted, so the disk counters stay truthful.
+        disk.enqueue(1, "t", payload(1, size = 10))
+        disk.enqueue(1, "t", payload(1, size = 10))
+        assertEquals(10L, disk.bytes)
+        disk.remove(1)
+        assertTrue(disk.isEmpty)
+
+        buffer.enqueue("t", payload(2))
+        assertEquals("RAM item is drainable", 2, buffer.takeNext()!!.payload[0].toInt())
+    }
+
+    @Test
+    fun `zero-length messages keep FIFO order across tiers`() {
+        open(ramMaxBytes = 0)
+        buffer.enqueue("a", ByteArray(0))
+        buffer.enqueue("b", ByteArray(0))
+        buffer.enqueue("c", ByteArray(0)) // spills a and b, although they weigh 0 bytes
+
+        val topics = mutableListOf<String>()
+        while (true) {
+            val item = buffer.takeNext() ?: break
+            topics += item.topic
+            buffer.remove(item)
+        }
+        assertEquals(listOf("a", "b", "c"), topics)
+    }
+
+    @Test
+    fun `without a disk tier the buffer is RAM-only and drops the oldest`() {
+        buffer = StoreAndForwardBuffer(disk = null, ramMaxBytes = 100)
+        repeat(4) { buffer.enqueue("t", payload(it + 1)) } // 160 bytes > 100
+
+        assertEquals(0L, buffer.diskBytes)
+        buffer.flushToDisk() // no-op
+        assertEquals(listOf(3, 4), drainMarkers())
+        assertTrue(context.databaseList().none { it.startsWith("spotflow_buffer_") })
     }
 
     @Test
@@ -86,6 +128,15 @@ class StoreAndForwardBufferTest {
         assertEquals(a.seq, b.seq)
         buffer.remove(a)
         assertNull(buffer.takeNext())
+    }
+
+    @Test
+    fun `closing an empty buffer deletes its file`() {
+        open(ramMaxBytes = 1_000)
+        buffer.enqueue("t", payload(1))
+        drainMarkers()
+        buffer.close()
+        assertTrue(context.databaseList().none { it == "spotflow_buffer_dev.db" })
     }
 
     @Test

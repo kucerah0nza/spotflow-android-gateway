@@ -15,7 +15,11 @@ import kotlin.coroutines.resumeWithException
  * One MQTT-over-TLS connection to the Spotflow cloud for a single device.
  *
  * Authentication follows the Spotflow ingest model: MQTT username = [deviceId], MQTT password = the
- * ingest key from [credentials]. Reassembled BLE messages are published as CBOR payloads; desired
+ * ingest key from [credentials]. The MQTT client identifier is also [deviceId], so the broker allows only
+ * one connection per device; the gateway keeps at most one uplink per device ID alive.
+ *
+ * Delivery is at-least-once (QoS 1 with a persistent session): a publish that timed out or was cut off by
+ * a disconnect may be delivered twice, so the backend must tolerate duplicates. Reassembled BLE messages are published as CBOR payloads; desired
  * configuration arriving from the cloud is delivered to [desiredConfigurationHandler].
  *
  * TLS uses the Android system trust store (Let's Encrypt ISRG Root X1), so no CA is bundled. This client
@@ -27,9 +31,13 @@ class MqttUplink(
     private val credentials: CredentialsProvider,
     private val config: MqttConfig = MqttConfig(),
 ) : Uplink {
-    /** Invoked (off the caller's thread) when a DESIRED_CONFIGURATION payload arrives from the cloud. */
+    /**
+     * Invoked (off the caller's thread) when a DESIRED_CONFIGURATION payload arrives from the cloud. The
+     * subscription uses manual acknowledgement, so the broker only considers a configuration delivered once
+     * the handler calls `ack` (i.e. after it was written to the device).
+     */
     @Volatile
-    override var desiredConfigurationHandler: ((ByteArray) -> Unit)? = null
+    override var desiredConfigurationHandler: ((ByteArray, () -> Unit) -> Unit)? = null
 
     private val client: Mqtt5AsyncClient = buildClient()
 
@@ -75,6 +83,7 @@ class MqttUplink(
                 .topicFilter(config.topics.desiredConfiguration)
                 .qos(config.qos)
                 .callback(::onCloudMessage)
+                .manualAcknowledgement(true)
                 .send()
                 .await()
         } catch (t: Throwable) {
@@ -99,7 +108,9 @@ class MqttUplink(
     }
 
     private fun onCloudMessage(publish: Mqtt5Publish) {
-        desiredConfigurationHandler?.invoke(publish.payloadAsBytes)
+        // No handler: leave it unacknowledged so the broker redelivers it rather than it being lost.
+        val handler = desiredConfigurationHandler ?: return
+        handler(publish.payloadAsBytes) { runCatching { publish.acknowledge() } }
     }
 
     /** Maps a HiveMQ connect failure to a clear, shareable exception carrying the broker's reason. */

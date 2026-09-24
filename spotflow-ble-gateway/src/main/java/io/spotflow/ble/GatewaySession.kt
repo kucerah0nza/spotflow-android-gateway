@@ -1,26 +1,16 @@
 package io.spotflow.ble
 
-import android.content.Context
-import android.util.Log
-import io.spotflow.ble.cloud.CredentialsProvider
-import io.spotflow.ble.cloud.MqttAuthException
 import io.spotflow.ble.cloud.MqttConfig
-import io.spotflow.ble.cloud.MqttUplink
-import io.spotflow.ble.cloud.PersistentMessageQueue
-import io.spotflow.ble.cloud.StoreAndForwardBuffer
-import io.spotflow.ble.cloud.Uplink
 import io.spotflow.ble.protocol.MessageType
 import io.spotflow.ble.transport.BleConnection
 import io.spotflow.ble.transport.ConnectionState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 
 /** Observable state of one device being gatewayed, surfaced to the host app / demo UI. */
 data class GatewayDeviceState(
@@ -39,21 +29,37 @@ data class GatewayDeviceState(
 )
 
 /**
- * Bridges a single [BleConnection] to the Spotflow cloud with store-and-forward buffering.
+ * Decides which devices the gateway relays. Called after the device ID has been read, before anything is
+ * sent to the cloud under that ID.
  *
- * Received BLE messages are enqueued to an on-disk [PersistentMessageQueue] (independent of network
- * state), and a separate drainer publishes them to MQTT, owning the connect/reconnect lifecycle. This
- * way diagnostics keep buffering (bounded, evict-oldest) while the phone is offline and flush in order
- * when connectivity returns.
+ * Managed mode connects to anything advertising the Spotflow service, and the BLE protocol does not
+ * authenticate devices — so without a filter, any nearby peripheral could publish data (and receive
+ * desired configuration) under any device ID in your workspace. Production integrations should accept
+ * only the devices they expect (e.g. an allowlist, or IDs provisioned to the signed-in user).
+ */
+fun interface DeviceFilter {
+    fun accept(address: String, deviceId: String): Boolean
+}
+
+/** Thrown when [DeviceFilter] rejects a device (or it reports an unusable device ID). Not retried. */
+class DeviceRejectedException(message: String) : Exception(message)
+
+/**
+ * Bridges a single [BleConnection] to the device's [CloudLink].
+ *
+ * Received BLE messages are enqueued to the link's store-and-forward buffer (independent of network
+ * state), and the link's drainer publishes them to MQTT, owning the connect/reconnect lifecycle. When
+ * the BLE link drops, the session ends but the cloud link lingers (see [CloudLinkRegistry]) to finish
+ * uploading what is buffered.
  */
 internal class GatewaySession(
-    private val context: Context,
     private val connection: BleConnection,
-    private val credentials: CredentialsProvider,
     private val mqttConfig: MqttConfig,
+    private val links: CloudLinkRegistry,
     private val onStatus: (GatewayDeviceState) -> Unit,
-    private val uplinkFactory: (deviceId: String) -> Uplink =
-        { id -> MqttUplink(id, credentials, mqttConfig) },
+    private val deviceFilter: DeviceFilter? = null,
+    /** Periodically read RSSI. Off for attached connections, whose GATT queue belongs to the host. */
+    private val pollRssi: Boolean = true,
 ) {
     /** Runs until the connection is torn down or the coroutine is cancelled. */
     suspend fun run() = coroutineScope {
@@ -61,7 +67,7 @@ internal class GatewaySession(
         val statusLock = Any()
         // Guarded: the state mirror, pump, and drainer all push concurrently on a multi-threaded
         // dispatcher, so an unsynchronized read-modify-write would lose updates.
-        fun push(update: (GatewayDeviceState) -> GatewayDeviceState) {
+        val push: StatusPush = { update ->
             synchronized(statusLock) {
                 status = update(status)
                 onStatus(status)
@@ -75,24 +81,20 @@ internal class GatewaySession(
         try {
             connection.prepare()
             val deviceId = connection.readDeviceId()
+            if (deviceId.isBlank()) throw DeviceRejectedException("device reported an empty device ID")
             push { it.copy(deviceId = deviceId) }
-
-            val diskMaxBytes = (mqttConfig.bufferMaxBytes - mqttConfig.ramBufferMaxBytes).coerceAtLeast(0)
-            val buffer = StoreAndForwardBuffer(
-                PersistentMessageQueue(context, deviceId, diskMaxBytes),
-                mqttConfig.ramBufferMaxBytes,
-            )
-            val uplink = uplinkFactory(deviceId)
-            uplink.desiredConfigurationHandler = { payload ->
-                launch { runCatching { connection.sendDesiredConfiguration(payload) } }
+            if (deviceFilter?.accept(connection.deviceAddress, deviceId) == false) {
+                throw DeviceRejectedException("device $deviceId rejected by the device filter")
             }
-            val drainSignal = Channel<Unit>(Channel.CONFLATED)
 
+            val link = links.claim(deviceId, push)
             try {
-                runCatching {
-                    buffer.enqueue(mqttConfig.topics.ingest, connection.readSessionMetadata())
-                    push { it.copy(ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
-                    drainSignal.trySend(Unit)
+                try {
+                    link.enqueue(mqttConfig.topics.ingest, connection.readSessionMetadata())
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (_: Throwable) {
+                    // Optional characteristic; relaying works without it.
                 }
 
                 // BLE -> buffer (RAM first; never blocks on the network).
@@ -103,23 +105,35 @@ internal class GatewaySession(
                             MessageType.REPORTED_CONFIGURATION -> mqttConfig.topics.reportedConfiguration
                             else -> return@collect
                         }
-                        buffer.enqueue(topic, message.payload)
-                        push { it.copy(ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
-                        drainSignal.trySend(Unit)
+                        link.enqueue(topic, message.payload)
                     }
                 }
 
                 // Buffer -> MQTT, owning connect/reconnect so offline just keeps buffering.
-                val drainer = launch { drain(uplink, buffer, drainSignal, ::push) }
+                val drainer = launch { link.drain(stopWhenEmpty = false) }
+
+                // Cloud -> device, in order, acknowledged to the broker only once written.
+                val desired = launch {
+                    link.deliverDesiredConfiguration { connection.sendDesiredConfiguration(it) }
+                }
 
                 // Periodically sample the BLE signal strength for the UI.
-                val rssiJob = launch {
-                    while (true) {
-                        runCatching { connection.readRssi() }.getOrNull()?.let { rssi ->
-                            push { it.copy(rssi = rssi) }
+                val rssiJob = if (pollRssi) {
+                    launch {
+                        while (true) {
+                            try {
+                                val rssi = connection.readRssi()
+                                push { it.copy(rssi = rssi) }
+                            } catch (c: CancellationException) {
+                                throw c
+                            } catch (_: Throwable) {
+                                // transient; try again next tick
+                            }
+                            delay(RSSI_INTERVAL_MS)
                         }
-                        delay(RSSI_INTERVAL_MS)
                     }
+                } else {
+                    null
                 }
 
                 try {
@@ -129,111 +143,21 @@ internal class GatewaySession(
                 } finally {
                     pump.cancel()
                     drainer.cancel()
-                    rssiJob.cancel()
+                    desired.cancel()
+                    rssiJob?.cancel()
                 }
             } finally {
-                // NonCancellable so this cleanup runs to completion even when the session is cancelled
-                // (Stop / Bluetooth off) — otherwise the flush that preserves unsent data could be skipped.
-                withContext(NonCancellable) {
-                    uplink.disconnect()
-                    buffer.flushToDisk() // preserve unsent data across the reconnect
-                    push { it.copy(cloudConnected = false, ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
-                    buffer.close()
-                }
+                // NonCancellable so the hand-off runs even when the session is cancelled (Stop /
+                // Bluetooth off) — the link then lingers to upload (or at least persist) what's buffered.
+                withContext(NonCancellable) { links.release(link) }
             }
         } finally {
             stateJob.cancel()
-            connection.close()
-        }
-    }
-
-    private suspend fun drain(
-        uplink: Uplink,
-        buffer: StoreAndForwardBuffer,
-        drainSignal: Channel<Unit>,
-        push: ((GatewayDeviceState) -> GatewayDeviceState) -> Unit,
-    ) {
-        var backoff = INITIAL_BACKOFF_MS
-        var attempts = 0
-        while (true) {
-            if (!uplink.isConnected) {
-                try {
-                    uplink.connect()
-                    push { it.copy(cloudConnected = true, error = null) }
-                    backoff = INITIAL_BACKOFF_MS
-                } catch (c: CancellationException) {
-                    throw c
-                } catch (auth: MqttAuthException) {
-                    throw auth // non-retryable: ends the session so the caller stops it
-                } catch (t: Throwable) {
-                    push { it.copy(cloudConnected = false, error = t.message) }
-                    delay(backoff)
-                    backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
-                    continue
-                }
-            }
-
-            val item = buffer.takeNext()
-            if (item == null) {
-                // Idle: wait for new data, but wake periodically to keep the MQTT link warm — so a
-                // drop during a quiet period is reconnected proactively instead of on the next message.
-                withTimeoutOrNull(IDLE_POLL_MS) { drainSignal.receiveCatching() }
-                continue
-            }
-
-            try {
-                val published = withTimeoutOrNull(PUBLISH_TIMEOUT_MS) {
-                    uplink.publish(item.topic, item.payload)
-                    true
-                } != null
-
-                if (!published) {
-                    // The publish stalled although the client still reports connected — typically a
-                    // half-open connection on a flaky network. Force a reconnect so a hung publish can't
-                    // block the buffer and make it fill up while the link looks connected.
-                    Log.w(TAG, "publish stalled >${PUBLISH_TIMEOUT_MS}ms; forcing reconnect")
-                    buffer.requeue(item)
-                    runCatching { uplink.disconnect() }
-                    push { it.copy(cloudConnected = false, ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
-                    continue
-                }
-
-                buffer.remove(item)
-                attempts = 0
-                backoff = INITIAL_BACKOFF_MS
-                push { it.copy(forwarded = it.forwarded + 1, ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
-            } catch (c: CancellationException) {
-                buffer.requeue(item) // don't lose the in-flight item on teardown; it gets flushed to disk
-                throw c
-            } catch (t: Throwable) {
-                if (uplink.isConnected) {
-                    // Connected but the publish failed: likely a poison message (e.g. too large).
-                    // Retry a few times, then drop it so it can't block the whole buffer forever.
-                    if (++attempts >= MAX_PUBLISH_ATTEMPTS) {
-                        Log.w(TAG, "dropping message after $attempts failures: ${t.message}")
-                        buffer.remove(item)
-                        attempts = 0
-                    } else {
-                        buffer.requeue(item)
-                    }
-                } else {
-                    buffer.requeue(item)
-                    push { it.copy(cloudConnected = false) }
-                }
-                push { it.copy(ramBytes = buffer.ramBytes, diskBytes = buffer.diskBytes) }
-                delay(backoff)
-                backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
-            }
+            withContext(NonCancellable) { connection.close() }
         }
     }
 
     private companion object {
-        const val TAG = "SpotflowGateway"
-        const val INITIAL_BACKOFF_MS = 1_000L
-        const val MAX_BACKOFF_MS = 30_000L
-        const val MAX_PUBLISH_ATTEMPTS = 5
-        const val IDLE_POLL_MS = 15_000L
-        const val PUBLISH_TIMEOUT_MS = 20_000L
         const val RSSI_INTERVAL_MS = 5_000L
     }
 }

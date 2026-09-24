@@ -22,8 +22,6 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import io.spotflow.ble.GatewayDeviceState
 import io.spotflow.ble.SpotflowGateway
-import io.spotflow.ble.cloud.MqttConfig
-import io.spotflow.ble.cloud.StaticIngestKey
 import io.spotflow.ble.service.SpotflowGatewayService
 import io.spotflow.ble.transport.ConnectionState
 import io.spotflow.gateway.demo.databinding.ActivityMainBinding
@@ -47,7 +45,9 @@ class MainActivity : AppCompatActivity() {
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
-            if (grants.values.all { it }) {
+            // Notifications are optional: the foreground service runs without them (the user just
+            // doesn't see its notification). Only the Bluetooth/location permissions are required.
+            if (grants.filterKeys { it != Manifest.permission.POST_NOTIFICATIONS }.values.all { it }) {
                 ensureBluetoothThenStart()
             } else {
                 Toast.makeText(this, R.string.permissions_required, Toast.LENGTH_LONG).show()
@@ -119,6 +119,14 @@ class MainActivity : AppCompatActivity() {
         observeDevices()
     }
 
+    override fun onResume() {
+        super.onResume()
+        // The gateway may be running without this activity having started it (activity recreated after
+        // rotation, app reopened, or the service restored after a process restart).
+        // gatewayEnabled covers the window right after Start, before the service has created its gateway.
+        syncControls(running = isGatewayRunning || keyStore.gatewayEnabled)
+    }
+
     override fun onStart() {
         super.onStart()
         ContextCompat.registerReceiver(
@@ -175,34 +183,32 @@ class MainActivity : AppCompatActivity() {
         keyStore.ingestKey = key // persist across restarts
         keyStore.bufferRamMb = ramMb
         keyStore.bufferFlashMb = flashMb
+        keyStore.gatewayEnabled = true // GatewayApp restores the service hooks after a process restart
 
-        val config = MqttConfig(
-            bufferMaxBytes = (ramMb + flashMb).toLong() * 1024L * 1024L,
-            ramBufferMaxBytes = ramMb.toLong() * 1024L * 1024L,
-        )
-        SpotflowGatewayService.gatewayFactory = { ctx -> SpotflowGateway(ctx, StaticIngestKey(key), config) }
-        SpotflowGatewayService.onReady = { gateway -> gateway.startScanning() }
+        configureGatewayService(key, ramMb, flashMb)
         SpotflowGatewayService.start(this)
 
-        binding.startButton.isEnabled = false
-        binding.stopButton.isEnabled = true
-        binding.ingestKeyLayout.isEnabled = false
-        binding.bufferRamMb.isEnabled = false
-        binding.bufferFlashMb.isEnabled = false
+        syncControls(running = true)
         binding.errorBanner.visibility = View.GONE
         binding.status.text = getString(R.string.scanning)
     }
 
     private fun stopGateway() {
+        keyStore.gatewayEnabled = false
         SpotflowGatewayService.stop(this)
-        binding.startButton.isEnabled = true
-        binding.stopButton.isEnabled = false
-        binding.ingestKeyLayout.isEnabled = true
-        binding.bufferRamMb.isEnabled = true
-        binding.bufferFlashMb.isEnabled = true
+        syncControls(running = false)
         binding.errorBanner.visibility = View.GONE
         binding.btBanner.visibility = View.GONE
         binding.status.text = getString(R.string.idle)
+    }
+
+    /** Enables Start/Stop and the settings fields to match whether the gateway is running. */
+    private fun syncControls(running: Boolean) {
+        binding.startButton.isEnabled = !running
+        binding.stopButton.isEnabled = running
+        binding.ingestKeyLayout.isEnabled = !running
+        binding.bufferRamMb.isEnabled = !running
+        binding.bufferFlashMb.isEnabled = !running
     }
 
     private fun observeDevices() {

@@ -15,22 +15,30 @@ import androidx.core.content.ContextCompat
 import io.spotflow.ble.cloud.CredentialsProvider
 import io.spotflow.ble.cloud.MqttAuthException
 import io.spotflow.ble.cloud.MqttConfig
+import io.spotflow.ble.cloud.MqttUplink
+import io.spotflow.ble.cloud.PersistentMessageQueue
+import io.spotflow.ble.cloud.StoreAndForwardBuffer
 import io.spotflow.ble.transport.AttachedBleConnection
+import io.spotflow.ble.transport.BleConnection
 import io.spotflow.ble.transport.ConnectionState
+import io.spotflow.ble.transport.DeviceUnreachableException
 import io.spotflow.ble.transport.ManagedBleConnection
 import io.spotflow.ble.transport.SpotflowGattSession
 import io.spotflow.ble.transport.SpotflowScanner
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 
@@ -39,36 +47,67 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * Two ways to feed it devices:
  *  - **Managed** — call [startScanning] and the gateway discovers, connects, and relays every device
- *    advertising the Spotflow service, reconnecting with backoff.
+ *    advertising the Spotflow service (that passes [deviceFilter]), reconnecting with backoff.
  *  - **Attach** — call [attach] with a `BluetoothGatt` the host app already owns (see
  *    [AttachedBleConnection] for the forwarding contract).
  *
+ * Buffered data is uploaded whenever the phone is online — also after a device disconnects, and for
+ * buffers left on disk by an earlier run (those are picked up when the gateway is created).
+ *
  * To keep relaying while the screen is off, run this from a foreground service (see
  * `SpotflowGatewayService`).
+ *
+ * @param deviceFilter decides which devices are relayed; see [DeviceFilter] for why production
+ *   integrations should set one. `null` accepts every device.
  */
 class SpotflowGateway(
-    private val context: Context,
+    context: Context,
     private val credentials: CredentialsProvider,
     private val mqttConfig: MqttConfig = MqttConfig(),
     private val requestedMtu: Int = SpotflowGattSession.MAX_MTU,
+    private val deviceFilter: DeviceFilter? = null,
 ) {
+    // Application context only: the gateway may outlive whatever component created it.
+    private val appContext = context.applicationContext
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val jobs = ConcurrentHashMap<String, Job>()
+
+    /** Addresses whose status is published; a status update for any other address is ignored. */
+    private val tracked = ConcurrentHashMap.newKeySet<String>()
+
+    private val links = CloudLinkRegistry(scope) { deviceId, push ->
+        val diskMaxBytes = (mqttConfig.bufferMaxBytes - mqttConfig.ramBufferMaxBytes).coerceAtLeast(0)
+        val disk = if (diskMaxBytes > 0) PersistentMessageQueue(appContext, deviceId, diskMaxBytes) else null
+        CloudLink(
+            deviceId,
+            StoreAndForwardBuffer(disk, mqttConfig.ramBufferMaxBytes),
+            MqttUplink(deviceId, credentials, mqttConfig),
+            push,
+        )
+    }
 
     private val _devices = MutableStateFlow<Map<String, GatewayDeviceState>>(emptyMap())
     /** Live per-device status, keyed by Bluetooth address. */
     val devices: StateFlow<Map<String, GatewayDeviceState>> = _devices
 
-    private val adapter: android.bluetooth.BluetoothAdapter?
-        get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+    private val adapter: BluetoothAdapter?
+        get() = (appContext.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
 
     /** True if the device has Bluetooth and it is currently turned on. */
     val isBluetoothEnabled: Boolean get() = adapter?.isEnabled == true
 
-    private val appContext = context.applicationContext
-
     @Volatile private var wantScanning = false
     @Volatile private var receiverRegistered = false
+
+    init {
+        // Upload buffers left on disk by an earlier run (e.g. the app was killed during an outage) even if
+        // those devices never come back.
+        scope.launch {
+            runCatching { PersistentMessageQueue.storedDeviceIds(appContext) }.getOrDefault(emptyList())
+                .forEach { id -> runCatching { links.recover(id) } }
+        }
+    }
 
     /**
      * Watches the Bluetooth adapter itself. Turning Bluetooth off often does not deliver a GATT
@@ -93,7 +132,7 @@ class SpotflowGateway(
         jobs.values.forEach { it.cancel() }
         jobs.clear()
         _devices.update { devices ->
-            devices.mapValues { it.value.copy(ble = ConnectionState.DISCONNECTED, cloudConnected = false) }
+            devices.mapValues { it.value.copy(ble = ConnectionState.DISCONNECTED, rssi = null) }
         }
     }
 
@@ -105,6 +144,7 @@ class SpotflowGateway(
         }
     }
 
+    @Synchronized
     private fun registerBluetoothReceiver() {
         if (receiverRegistered) return
         ContextCompat.registerReceiver(
@@ -128,12 +168,13 @@ class SpotflowGateway(
             Log.w(TAG, "cannot scan: Bluetooth is ${if (bluetoothAdapter == null) "unavailable" else "off"}")
             return
         }
-        jobs[SCAN_JOB_KEY] = scope.launch {
+        // LAZY: register the job before it runs, so its own cleanup can never race the registration.
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 SpotflowScanner(bluetoothAdapter).scan().collect { device ->
                     if (!jobs.containsKey(device.address)) {
                         launchManaged(device.address) { autoConnect ->
-                            ManagedBleConnection(context, device, requestedMtu, autoConnect)
+                            ManagedBleConnection(appContext, device, requestedMtu, autoConnect)
                         }
                     }
                 }
@@ -143,10 +184,12 @@ class SpotflowGateway(
                 // e.g. Bluetooth turned off mid-scan; end the scan cleanly instead of crashing.
                 Log.w(TAG, "scanning stopped: ${t.message}")
             } finally {
-                // Allow startScanning() to resume discovery later (e.g. once Bluetooth is back on).
-                jobs.remove(SCAN_JOB_KEY)
+                // Allow startScanning() to resume discovery later — but only remove *this* job, never a
+                // newer scan started after a quick stop/start.
+                jobs.remove(SCAN_JOB_KEY, coroutineContext.job)
             }
         }
+        if (jobs.putIfAbsent(SCAN_JOB_KEY, job) == null) job.start() else job.cancel()
     }
 
     fun stopScanning() {
@@ -156,9 +199,10 @@ class SpotflowGateway(
 
     private fun launchManaged(
         address: String,
-        connectionFactory: (autoConnect: Boolean) -> io.spotflow.ble.transport.BleConnection,
+        connectionFactory: (autoConnect: Boolean) -> BleConnection,
     ) {
-        jobs[address] = scope.launch {
+        tracked += address
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             var firstAttempt = true
             var backoff = INITIAL_BACKOFF_MS
             while (isActive) {
@@ -166,7 +210,7 @@ class SpotflowGateway(
                 // autoConnect for reconnects so Android re-attaches whenever the device reappears.
                 val connection = connectionFactory(!firstAttempt)
                 try {
-                    GatewaySession(context, connection, credentials, mqttConfig, ::updateStatus).run()
+                    GatewaySession(connection, mqttConfig, links, ::updateStatus, deviceFilter).run()
                     backoff = INITIAL_BACKOFF_MS // clean end; reset backoff before reconnect
                 } catch (c: CancellationException) {
                     throw c // normal teardown (Stop / Bluetooth off / detach) — not an error
@@ -175,9 +219,20 @@ class SpotflowGateway(
                     Log.w(TAG, "auth rejected for $address: ${t.message}")
                     updateStatus(currentOf(address).copy(error = t.message, cloudConnected = false))
                     break
+                } catch (t: DeviceRejectedException) {
+                    // Not ours: stop, keep the job registered so the scanner doesn't reconnect it, and hide it.
+                    Log.w(TAG, "ignoring $address: ${t.message}")
+                    untrack(address)
+                    break
+                } catch (t: DeviceUnreachableException) {
+                    // Gone for a long time: free the GATT slot. The scanner reconnects it if it reappears.
+                    Log.i(TAG, "giving up on $address: ${t.message}")
+                    untrack(address)
+                    jobs.remove(address, coroutineContext.job)
+                    break
                 } catch (t: Throwable) {
                     Log.w(TAG, "session for $address failed: ${t.message}")
-                    updateStatus(currentOf(address).copy(error = t.message, cloudConnected = false))
+                    updateStatus(currentOf(address).copy(error = t.message))
                 }
                 firstAttempt = false
                 if (!isActive) break
@@ -185,24 +240,39 @@ class SpotflowGateway(
                 backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
             }
         }
+        jobs[address] = job
+        job.start()
     }
 
     // ---- attach mode -----------------------------------------------------------------------------
 
     /**
      * Attaches to a GATT the host app already owns. The host must forward its GATT callbacks to the
-     * returned connection's `gattCallback` and must not issue competing GATT operations while active.
-     * Attach sessions are single-shot: the host owns reconnection.
+     * returned connection's `gattCallback`, and must run any GATT operations of its own through
+     * [AttachedBleConnection.runExclusive] while attached. Attach sessions are single-shot: the host
+     * owns reconnection.
+     *
+     * @param pollRssi read RSSI periodically for [GatewayDeviceState.rssi]. Off by default, since it
+     *   issues extra operations on the host's GATT.
      */
     @SuppressLint("MissingPermission")
-    fun attach(gatt: BluetoothGatt): AttachedBleConnection {
+    fun attach(gatt: BluetoothGatt, pollRssi: Boolean = false): AttachedBleConnection {
+        registerBluetoothReceiver()
         val connection = AttachedBleConnection(gatt, requestedMtu)
         val address = connection.deviceAddress
+        tracked += address
+        val previous = jobs.remove(address)
         jobs[address] = scope.launch {
+            // Let a previous session for this address release its cloud link first, or the new one
+            // would be refused as a duplicate of the same device ID.
+            previous?.cancelAndJoin()
             try {
-                GatewaySession(context, connection, credentials, mqttConfig, ::updateStatus).run()
+                GatewaySession(connection, mqttConfig, links, ::updateStatus, deviceFilter, pollRssi).run()
             } catch (c: CancellationException) {
                 throw c // normal teardown — not an error
+            } catch (t: DeviceRejectedException) {
+                Log.w(TAG, "ignoring $address: ${t.message}")
+                untrack(address)
             } catch (t: Throwable) {
                 updateStatus(currentOf(address).copy(error = t.message, cloudConnected = false))
             }
@@ -210,18 +280,23 @@ class SpotflowGateway(
         return connection
     }
 
-    /** Stops gatewaying a device (managed or attached) and cancels its session. */
+    /**
+     * Stops gatewaying a device (managed or attached) and cancels its session. Data it already buffered
+     * is still uploaded in the background.
+     */
     fun detach(address: String) {
+        untrack(address)
         jobs.remove(address)?.cancel()
-        _devices.update { it - address }
     }
 
-    /** Stops everything and releases resources. */
+    /** Stops everything and releases resources (unsent data is persisted where a flash tier exists). */
     fun shutdown() {
         wantScanning = false
-        if (receiverRegistered) {
-            runCatching { appContext.unregisterReceiver(bluetoothStateReceiver) }
-            receiverRegistered = false
+        synchronized(this) {
+            if (receiverRegistered) {
+                runCatching { appContext.unregisterReceiver(bluetoothStateReceiver) }
+                receiverRegistered = false
+            }
         }
         jobs.values.forEach { it.cancel() }
         jobs.clear()
@@ -229,7 +304,14 @@ class SpotflowGateway(
     }
 
     private fun updateStatus(state: GatewayDeviceState) {
-        _devices.update { it + (state.address to state) }
+        // Checked inside update(): if a detach wins the race, the CAS retries and sees it untracked, so a
+        // late update from a cancelled session can't resurrect a detached device.
+        _devices.update { if (state.address in tracked) it + (state.address to state) else it }
+    }
+
+    private fun untrack(address: String) {
+        tracked -= address
+        _devices.update { it - address }
     }
 
     private fun currentOf(address: String): GatewayDeviceState =
