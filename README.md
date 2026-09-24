@@ -216,6 +216,15 @@ Requires **JDK 17** and the **Android SDK** (`compileSdk 35`, `minSdk 26`). Poin
 
 CI (`.github/workflows/ci.yml`) runs the library unit tests on every push and pull request.
 
+### Signing
+
+The demo's signing key is never committed. Gradle reads it from `SPOTFLOW_KEYSTORE_FILE`,
+`SPOTFLOW_KEYSTORE_PASSWORD`, `SPOTFLOW_KEY_ALIAS` and `SPOTFLOW_KEY_PASSWORD`; CI decodes the keystore
+from the `SPOTFLOW_KEYSTORE_BASE64` repository secret (plus the three others). With the key, debug and
+release builds are signed identically, so every CI-built APK can update the previous one. Without it,
+local debug builds use your machine's debug key and release builds are unsigned — and the release
+workflow refuses to publish.
+
 ## Testing
 
 1. **Unit (no hardware):** `FrameCodecTest` covers fragmentation/reassembly incl. the 23-byte MTU,

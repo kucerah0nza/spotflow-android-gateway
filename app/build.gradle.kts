@@ -15,25 +15,27 @@ android {
         versionName = "0.1.3"
     }
 
-    signingConfigs {
-        // A stable, shared signing key committed to the repo so every build — local and CI — produces
-        // consistently-signed, updatable APKs. This is a development key (its password is not secret); a
-        // real production/Play signing key would live in CI secrets instead.
-        create("shared") {
-            storeFile = file("signing/spotflow-shared.keystore")
-            storePassword = "spotflow"
-            keyAlias = "spotflow"
-            keyPassword = "spotflow"
+    // The signing key comes from the environment (CI secrets), never from the repository — anyone holding
+    // it can ship an "update" that Android accepts as this app. When set, it signs both debug and release
+    // builds, so every CI-built APK is consistently signed and can update the previous one. Without it
+    // (local builds, fork PRs) debug builds use the machine's default debug key and release is unsigned.
+    val keystoreFile = System.getenv("SPOTFLOW_KEYSTORE_FILE")?.let(::file)?.takeIf { it.exists() }
+    val sharedSigning = keystoreFile?.let {
+        signingConfigs.create("shared") {
+            storeFile = it
+            storePassword = System.getenv("SPOTFLOW_KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("SPOTFLOW_KEY_ALIAS")
+            keyPassword = System.getenv("SPOTFLOW_KEY_PASSWORD")
         }
     }
 
     buildTypes {
         debug {
-            signingConfig = signingConfigs.getByName("shared")
+            if (sharedSigning != null) signingConfig = sharedSigning
         }
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("shared")
+            signingConfig = sharedSigning
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",

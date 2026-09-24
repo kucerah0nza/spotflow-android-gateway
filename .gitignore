@@ -15,3 +15,7 @@ local.properties
 
 # Built/exported APKs
 *.apk
+
+# Signing keys never belong in the repo (CI decodes one from secrets)
+*.keystore
+*.jks
