@@ -58,6 +58,12 @@ devices never come back.
 - **GATT** service `26530001-81E5-4861-82AE-2C92E6887922`, characteristics: Capabilities (`0002`),
   Device ID (`0003`), Session Metadata (`0004`), TX Stream `NOTIFY` (`0005`), RX Stream `WRITE`-no-response
   (`0006`).
+- **Connection order** — as the protocol specifies: discover services and negotiate MTU, read
+  Capabilities (protocol version), Device ID and Session Metadata, and only then enable TX Stream
+  notifications. (Some devices stop answering reads once their TX stream is running.)
+- **Link parameters** — if a device requests a supervision timeout shorter than 2 s (seen: 420 ms, which
+  drops the link on any brief radio gap), the gateway asks Android for balanced connection priority, which
+  renegotiates a 5 s timeout. Managed mode only.
 - **Framing** — a message may exceed the negotiated ATT MTU (as low as 23 bytes), so it is split into
   fragments. `FrameCodec` handles fragmentation (outgoing) and reassembly (incoming). Flags: `IS_FIRST`
   (`0x01`), `IS_LAST` (`0x02`).
@@ -150,8 +156,9 @@ flowchart TD
     E --> C
 ```
 
-- **Reconnect** — a dropped BLE link is reconnected automatically (a direct connect first, then
-  `autoConnect` so Android re-attaches the moment a known device reappears, with exponential backoff). A
+- **Reconnect** — a dropped BLE link is reconnected automatically: right after a working session drops,
+  with a direct connect (about a second when the device is still in range); if that fails, with
+  `autoConnect` so Android re-attaches the moment the device reappears, with exponential backoff. A
   device that stays away for 10 minutes is released (freeing one of Android's limited GATT client slots)
   and picked up again by the scanner when it reappears. The MQTT uplink reconnects on its own too, and the
   drainer keeps the link warm during idle periods so the status stays connected rather than only

@@ -122,9 +122,12 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         // The gateway may be running without this activity having started it (activity recreated after
-        // rotation, app reopened, or the service restored after a process restart).
-        // gatewayEnabled covers the window right after Start, before the service has created its gateway.
-        syncControls(running = isGatewayRunning || keyStore.gatewayEnabled)
+        // rotation, app reopened, or the service restored after a process restart) — or it may have been
+        // left enabled but not be running (app updated, phone rebooted): then resume it. This also covers
+        // the window right after Start, before the service has created its gateway.
+        val running = isGatewayRunning || resumeGatewayIfEnabled(this, keyStore)
+        syncControls(running = running)
+        if (!running) binding.status.text = getString(R.string.idle)
     }
 
     override fun onStart() {

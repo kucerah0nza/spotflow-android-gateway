@@ -12,7 +12,7 @@ enum class ConnectionState {
     /** GATT link is being established (managed mode only). */
     CONNECTING,
 
-    /** Discovering services / negotiating MTU / enabling notifications. */
+    /** Discovering services / negotiating MTU / reading characteristics. */
     PREPARING,
 
     /** Ready: notifications enabled, characteristics resolved, messages flowing. */
@@ -45,11 +45,17 @@ interface BleConnection {
     val mtu: Int
 
     /**
-     * Establishes readiness: for managed connections this connects the GATT; for attached connections
-     * it discovers services on the host-provided GATT. In both cases it negotiates MTU and enables TX
-     * notifications. Returns once [state] reaches [ConnectionState.READY].
+     * Establishes the link: for managed connections this connects the GATT; for attached connections it
+     * uses the host-provided GATT. In both cases it discovers services and negotiates MTU. Messages only
+     * start flowing after [startStreaming].
      */
     suspend fun prepare()
+
+    /** Reads the protocol version from the Capabilities characteristic (the first byte). */
+    suspend fun readProtocolVersion(): Int
+
+    /** Enables TX Stream notifications; [state] then reaches [ConnectionState.READY]. */
+    suspend fun startStreaming()
 
     /** Reads the device ID (MQTT username) from the Device ID characteristic. */
     suspend fun readDeviceId(): String

@@ -17,8 +17,8 @@ import kotlinx.coroutines.flow.StateFlow
  *  2. Run its own GATT operations through [runExclusive] while attached (the Android stack allows only
  *     one outstanding GATT operation at a time, so unsynchronized operations would collide).
  *
- * [prepare] assumes the GATT is already connected; it discovers services, negotiates MTU, and enables
- * TX notifications. [close] detaches without disconnecting the host's GATT.
+ * [prepare] assumes the GATT is already connected; it discovers services and negotiates MTU, and
+ * [startStreaming] enables TX notifications. [close] detaches without disconnecting the host's GATT.
  */
 class AttachedBleConnection(
     private val gatt: BluetoothGatt,
@@ -36,6 +36,12 @@ class AttachedBleConnection(
     override val mtu: Int get() = session.mtu
 
     override suspend fun prepare() = session.prepare()
+
+    override suspend fun readProtocolVersion(): Int =
+        session.read(GattProfile.CAPABILITIES).firstOrNull()?.toInt()?.and(0xFF)
+            ?: throw IllegalStateException("Capabilities characteristic is empty")
+
+    override suspend fun startStreaming() = session.startStreaming()
 
     override suspend fun readDeviceId(): String =
         session.read(GattProfile.DEVICE_ID).toString(Charsets.UTF_8).trim()

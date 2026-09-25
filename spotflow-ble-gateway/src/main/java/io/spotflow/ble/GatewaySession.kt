@@ -1,5 +1,6 @@
 package io.spotflow.ble
 
+import android.util.Log
 import io.spotflow.ble.cloud.MqttConfig
 import io.spotflow.ble.protocol.MessageType
 import io.spotflow.ble.transport.BleConnection
@@ -18,6 +19,7 @@ data class GatewayDeviceState(
     val deviceId: String? = null,
     val ble: ConnectionState = ConnectionState.DISCONNECTED,
     val cloudConnected: Boolean = false,
+    /** Messages delivered to the cloud for this device since the gateway started (across reconnects). */
     val forwarded: Long = 0,
     /** Latest BLE signal strength in dBm (higher/closer to 0 is stronger), or null if not yet read. */
     val rssi: Int? = null,
@@ -56,30 +58,40 @@ internal class GatewaySession(
     private val connection: BleConnection,
     private val mqttConfig: MqttConfig,
     private val links: CloudLinkRegistry,
-    private val onStatus: (GatewayDeviceState) -> Unit,
+    /**
+     * Applies updates to this device's single status entry, shared with its [CloudLink] — so the buffer
+     * and cloud state the link reports carry over across BLE reconnects instead of being reset.
+     */
+    private val status: StatusPush,
     private val deviceFilter: DeviceFilter? = null,
     /** Periodically read RSSI. Off for attached connections, whose GATT queue belongs to the host. */
     private val pollRssi: Boolean = true,
 ) {
     /** Runs until the connection is torn down or the coroutine is cancelled. */
     suspend fun run() = coroutineScope {
-        var status = GatewayDeviceState(connection.deviceAddress)
-        val statusLock = Any()
-        // Guarded: the state mirror, pump, and drainer all push concurrently on a multi-threaded
-        // dispatcher, so an unsynchronized read-modify-write would lose updates.
-        val push: StatusPush = { update ->
-            synchronized(statusLock) {
-                status = update(status)
-                onStatus(status)
-            }
-        }
+        val push = status
+        // A new link-level attempt: reset what describes the BLE link only. Buffer, cloud and delivery
+        // figures belong to the device's cloud link, which may still be holding (and uploading) data.
+        push { it.copy(rssi = null, error = null) }
 
         val stateJob = launch {
             connection.state.collect { bleState -> push { it.copy(ble = bleState) } }
         }
 
         try {
+            // Order per the Spotflow BLE protocol: read Capabilities, Device ID and Session Metadata
+            // first; enable the TX stream last.
             connection.prepare()
+            try {
+                val version = connection.readProtocolVersion()
+                if (version != SUPPORTED_PROTOCOL_VERSION) {
+                    Log.w(TAG, "device reports protocol version $version; this gateway speaks $SUPPORTED_PROTOCOL_VERSION")
+                }
+            } catch (c: CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                Log.w(TAG, "could not read protocol version: ${t.message}")
+            }
             val deviceId = connection.readDeviceId()
             if (deviceId.isBlank()) throw DeviceRejectedException("device reported an empty device ID")
             push { it.copy(deviceId = deviceId) }
@@ -93,8 +105,9 @@ internal class GatewaySession(
                     link.enqueue(mqttConfig.topics.ingest, connection.readSessionMetadata())
                 } catch (c: CancellationException) {
                     throw c
-                } catch (_: Throwable) {
+                } catch (t: Throwable) {
                     // Optional characteristic; relaying works without it.
+                    Log.w(TAG, "session metadata unavailable for $deviceId: ${t.message}")
                 }
 
                 // BLE -> buffer (RAM first; never blocks on the network).
@@ -116,6 +129,9 @@ internal class GatewaySession(
                 val desired = launch {
                     link.deliverDesiredConfiguration { connection.sendDesiredConfiguration(it) }
                 }
+
+                // Reads are done: start the device's TX stream.
+                connection.startStreaming()
 
                 // Periodically sample the BLE signal strength for the UI.
                 val rssiJob = if (pollRssi) {
@@ -158,6 +174,8 @@ internal class GatewaySession(
     }
 
     private companion object {
+        const val TAG = "SpotflowGateway"
+        const val SUPPORTED_PROTOCOL_VERSION = 1
         const val RSSI_INTERVAL_MS = 5_000L
     }
 }

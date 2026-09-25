@@ -35,7 +35,7 @@ class ManagedBleConnection(
 
     private val context = context.applicationContext
 
-    private val session = SpotflowGattSession(requestedMtu)
+    private val session = SpotflowGattSession(requestedMtu, guardSupervisionTimeout = true)
 
     override val deviceAddress: String get() = device.address
     override val state: StateFlow<ConnectionState> get() = session.state
@@ -62,6 +62,12 @@ class ManagedBleConnection(
         }
         session.prepare()
     }
+
+    override suspend fun readProtocolVersion(): Int =
+        session.read(GattProfile.CAPABILITIES).firstOrNull()?.toInt()?.and(0xFF)
+            ?: throw IllegalStateException("Capabilities characteristic is empty")
+
+    override suspend fun startStreaming() = session.startStreaming()
 
     override suspend fun readDeviceId(): String =
         session.read(GattProfile.DEVICE_ID).toString(Charsets.UTF_8).trim()

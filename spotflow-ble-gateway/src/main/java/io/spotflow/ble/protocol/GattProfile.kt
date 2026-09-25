@@ -29,4 +29,16 @@ object GattProfile {
 
     /** Client Characteristic Configuration Descriptor, used to enable notifications on TX_STREAM. */
     val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805F9B34FB")
+
+    /** A readable name for [uuid], for logs and error messages. */
+    fun name(uuid: UUID): String = when (uuid) {
+        SERVICE -> "Spotflow service"
+        CAPABILITIES -> "Capabilities"
+        DEVICE_ID -> "Device ID"
+        SESSION_METADATA -> "Session Metadata"
+        TX_STREAM -> "TX Stream"
+        RX_STREAM -> "RX Stream"
+        CCCD -> "CCCD"
+        else -> uuid.toString()
+    }
 }
