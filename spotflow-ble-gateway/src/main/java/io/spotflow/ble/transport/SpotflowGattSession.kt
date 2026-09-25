@@ -39,12 +39,24 @@ import java.io.IOException
  */
 internal class SpotflowGattSession(
     private val requestedMtu: Int = MAX_MTU,
+    /**
+     * Counter a peripheral's too-short supervision timeout (see `onConnectionUpdated` in [callback]).
+     * Managed mode only: an attached GATT's link parameters belong to the host.
+     */
+    private val guardSupervisionTimeout: Boolean = false,
 ) {
     companion object {
         private const val TAG = "SpotflowGatt"
         private const val LARGE_MESSAGE_BYTES = 4096
         private const val OP_TIMEOUT_MS = 10_000L
         const val MAX_MTU = 517
+
+        /**
+         * Shortest supervision timeout tolerated from the peripheral, in 10 ms units (2 s). Shorter ones
+         * drop the link on any brief radio gap (Wi-Fi coexistence, the phone in a pocket).
+         */
+        private const val MIN_SUPERVISION_TIMEOUT = 200
+        private const val MAX_PRIORITY_REQUESTS = 3
         private val CCCD_ENABLE_NOTIFICATION = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
     }
 
@@ -53,8 +65,8 @@ internal class SpotflowGattSession(
      * peripheral must not park a session forever. Not used for connect(), whose autoConnect waits by
      * design.
      */
-    private suspend fun <T> CompletableDeferred<T>.awaitOp(): T =
-        withTimeoutOrNull(OP_TIMEOUT_MS) { await() } ?: throw IOException("GATT operation timed out")
+    private suspend fun <T> CompletableDeferred<T>.awaitOp(operation: String): T =
+        withTimeoutOrNull(OP_TIMEOUT_MS) { await() } ?: throw IOException("GATT $operation timed out")
 
     private val _state = MutableStateFlow(ConnectionState.DISCONNECTED)
     val state: StateFlow<ConnectionState> = _state
@@ -82,6 +94,7 @@ internal class SpotflowGattSession(
     @Volatile private var pendingRssi: CompletableDeferred<Int>? = null
 
     private var gatt: BluetoothGatt? = null
+    @Volatile private var priorityRequests = 0
     private var txSeq = 0
 
     fun attachGatt(gatt: BluetoothGatt) {
@@ -94,6 +107,7 @@ internal class SpotflowGattSession(
             this@SpotflowGattSession.gatt = gatt
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
+                    priorityRequests = 0
                     if (status == BluetoothGatt.GATT_SUCCESS) {
                         pendingConnect?.complete(Unit)
                     } else {
@@ -163,6 +177,27 @@ internal class SpotflowGattSession(
             } else {
                 pendingDescriptor?.completeExceptionally(IllegalStateException("descriptor write failed: $status"))
             }
+        }
+
+        /**
+         * Not in the public SDK (hidden since API 26), but the framework calls it on every link
+         * parameter change, so a method with this exact signature receives it (no `override` keyword:
+         * the SDK stubs don't declare it).
+         *
+         * Some peripherals request a very short supervision timeout (e.g. 420 ms). The link then drops
+         * whenever the radio misses packets for that long, which happens constantly on a phone. Asking
+         * Android for BALANCED priority renegotiates the link with Android's 5 s supervision timeout.
+         * Capped per connection, so a peripheral that insists can't cause an endless renegotiation.
+         */
+        @Suppress("unused")
+        fun onConnectionUpdated(gatt: BluetoothGatt, interval: Int, latency: Int, timeout: Int, status: Int) {
+            if (!guardSupervisionTimeout || status != BluetoothGatt.GATT_SUCCESS) return
+            if (timeout >= MIN_SUPERVISION_TIMEOUT || priorityRequests >= MAX_PRIORITY_REQUESTS) return
+            priorityRequests++
+            Log.i(TAG, "peripheral set a ${timeout * 10} ms supervision timeout; requesting a longer one")
+            @SuppressLint("MissingPermission")
+            val requested = runCatching { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED) }
+            if (requested.getOrNull() != true) Log.w(TAG, "connection priority request rejected")
         }
 
         override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
@@ -246,7 +281,11 @@ internal class SpotflowGattSession(
         }
     }
 
-    /** Discover services, negotiate MTU, and enable TX notifications. */
+    /**
+     * Discover services and negotiate MTU. TX notifications are enabled separately ([startStreaming]),
+     * after the gateway has read the device's characteristics — the order the Spotflow BLE protocol
+     * specifies. Some devices don't answer reads once their TX stream is running.
+     */
     @SuppressLint("MissingPermission")
     suspend fun prepare() = opLock.withLock {
         val g = requireGatt()
@@ -254,8 +293,11 @@ internal class SpotflowGattSession(
 
         discover(g)
         negotiateMtu(g)
-        enableTxNotifications(g)
+    }
 
+    /** Enables TX Stream notifications; messages start flowing on [incoming]. */
+    suspend fun startStreaming() = opLock.withLock {
+        enableTxNotifications(requireGatt())
         _state.value = ConnectionState.READY
     }
 
@@ -265,7 +307,7 @@ internal class SpotflowGattSession(
         pendingDiscover = deferred
         try {
             check(g.discoverServices()) { "discoverServices() rejected" }
-            deferred.awaitOp()
+            deferred.awaitOp("service discovery")
         } finally {
             pendingDiscover = null
         }
@@ -310,7 +352,7 @@ internal class SpotflowGattSession(
                     check(g.writeDescriptor(cccd)) { "writeDescriptor rejected" }
                 }
             }
-            deferred.awaitOp()
+            deferred.awaitOp("enable notifications (CCCD write)")
         } finally {
             pendingDescriptor = null
         }
@@ -324,7 +366,7 @@ internal class SpotflowGattSession(
         pendingRead = deferred
         try {
             check(g.readCharacteristic(ch)) { "readCharacteristic($uuid) rejected" }
-            deferred.awaitOp()
+            deferred.awaitOp("read ${GattProfile.name(uuid)}")
         } finally {
             pendingRead = null
         }
@@ -338,7 +380,7 @@ internal class SpotflowGattSession(
         pendingRssi = deferred
         try {
             check(g.readRemoteRssi()) { "readRemoteRssi() rejected" }
-            deferred.awaitOp()
+            deferred.awaitOp("RSSI read")
         } finally {
             pendingRssi = null
         }
@@ -371,7 +413,7 @@ internal class SpotflowGattSession(
                     check(g.writeCharacteristic(ch)) { "writeCharacteristic rejected" }
                 }
             }
-            deferred.awaitOp()
+            deferred.awaitOp("write")
         } finally {
             pendingWrite = null
         }

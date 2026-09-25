@@ -33,8 +33,19 @@ internal class CloudLink(
     val deviceId: String,
     private val buffer: StoreAndForwardBuffer,
     private val uplink: Uplink,
-    @Volatile var push: StatusPush,
+    initialPush: StatusPush,
 ) {
+    /**
+     * Where status updates go: the current BLE session's status (or a no-op for a recovered link).
+     * Replacing it — a new session taking over this link — immediately publishes the link's current
+     * state, since a link that is already connected won't report "connected" again on its own.
+     */
+    @Volatile var push: StatusPush = initialPush
+        set(value) {
+            field = value
+            publishSnapshot()
+        }
+
     private val drainSignal = Channel<Unit>(Channel.CONFLATED)
 
     /** Set once the broker rejected the credentials; the link is then closed rather than kept alive. */
@@ -196,6 +207,20 @@ internal class CloudLink(
         runCatching { uplink.disconnect() }
         push { it.copy(cloudConnected = false) }
         runCatching { buffer.close() }
+    }
+
+    private fun publishSnapshot() {
+        val connected = uplink.isConnected
+        val ram = buffer.ramBytes
+        val disk = buffer.diskBytes
+        push {
+            it.copy(
+                cloudConnected = connected,
+                error = if (connected) null else it.error,
+                ramBytes = ram,
+                diskBytes = disk,
+            )
+        }
     }
 
     private fun pushBuffer() {

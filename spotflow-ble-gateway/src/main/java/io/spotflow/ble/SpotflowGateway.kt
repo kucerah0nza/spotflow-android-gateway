@@ -203,21 +203,25 @@ class SpotflowGateway(
     ) {
         tracked += address
         val job = scope.launch(start = CoroutineStart.LAZY) {
-            var firstAttempt = true
+            // Direct connect while the device is likely in range — right after the scan found it, or right
+            // after a working session dropped (usually a brief radio gap). Direct connects take about a
+            // second; autoConnect scans at a low duty cycle and can take many seconds. Only after a direct
+            // attempt fails does it fall back to autoConnect, which re-attaches whenever the device reappears.
+            var direct = true
             var backoff = INITIAL_BACKOFF_MS
             while (isActive) {
-                // Direct connect on the first attempt (device is in range from the scan); use
-                // autoConnect for reconnects so Android re-attaches whenever the device reappears.
-                val connection = connectionFactory(!firstAttempt)
+                val connection = connectionFactory(!direct)
+                var cleanEnd = false
                 try {
-                    GatewaySession(connection, mqttConfig, links, ::updateStatus, deviceFilter).run()
-                    backoff = INITIAL_BACKOFF_MS // clean end; reset backoff before reconnect
+                    GatewaySession(connection, mqttConfig, links, statusOf(address), deviceFilter).run()
+                    cleanEnd = true
+                    backoff = INITIAL_BACKOFF_MS
                 } catch (c: CancellationException) {
                     throw c // normal teardown (Stop / Bluetooth off / detach) — not an error
                 } catch (t: MqttAuthException) {
                     // The ingest key won't change until the gateway is restarted; stop retrying.
                     Log.w(TAG, "auth rejected for $address: ${t.message}")
-                    updateStatus(currentOf(address).copy(error = t.message, cloudConnected = false))
+                    statusOf(address).invoke { it.copy(error = t.message, cloudConnected = false) }
                     break
                 } catch (t: DeviceRejectedException) {
                     // Not ours: stop, keep the job registered so the scanner doesn't reconnect it, and hide it.
@@ -232,12 +236,16 @@ class SpotflowGateway(
                     break
                 } catch (t: Throwable) {
                     Log.w(TAG, "session for $address failed: ${t.message}")
-                    updateStatus(currentOf(address).copy(error = t.message))
+                    statusOf(address).invoke { it.copy(error = t.message) }
                 }
-                firstAttempt = false
+                direct = cleanEnd
                 if (!isActive) break
-                delay(backoff)
-                backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
+                if (cleanEnd) {
+                    delay(RECONNECT_DELAY_MS)
+                } else {
+                    delay(backoff)
+                    backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
+                }
             }
         }
         jobs[address] = job
@@ -267,14 +275,14 @@ class SpotflowGateway(
             // would be refused as a duplicate of the same device ID.
             previous?.cancelAndJoin()
             try {
-                GatewaySession(connection, mqttConfig, links, ::updateStatus, deviceFilter, pollRssi).run()
+                GatewaySession(connection, mqttConfig, links, statusOf(address), deviceFilter, pollRssi).run()
             } catch (c: CancellationException) {
                 throw c // normal teardown — not an error
             } catch (t: DeviceRejectedException) {
                 Log.w(TAG, "ignoring $address: ${t.message}")
                 untrack(address)
             } catch (t: Throwable) {
-                updateStatus(currentOf(address).copy(error = t.message, cloudConnected = false))
+                statusOf(address).invoke { it.copy(error = t.message, cloudConnected = false) }
             }
         }
         return connection
@@ -303,10 +311,16 @@ class SpotflowGateway(
         scope.cancel()
     }
 
-    private fun updateStatus(state: GatewayDeviceState) {
-        // Checked inside update(): if a detach wins the race, the CAS retries and sees it untracked, so a
-        // late update from a cancelled session can't resurrect a detached device.
-        _devices.update { if (state.address in tracked) it + (state.address to state) else it }
+    /**
+     * The status updater for [address]: every update — from any BLE session or the device's cloud link —
+     * is applied atomically to the one entry in [devices], so concurrent writers never overwrite each
+     * other with stale copies. The tracked check runs inside update(): if a detach wins the race, the CAS
+     * retries and sees it untracked, so a late update can't resurrect a detached device.
+     */
+    private fun statusOf(address: String): StatusPush = { change ->
+        _devices.update { map ->
+            if (address in tracked) map + (address to change(map[address] ?: GatewayDeviceState(address))) else map
+        }
     }
 
     private fun untrack(address: String) {
@@ -314,13 +328,11 @@ class SpotflowGateway(
         _devices.update { it - address }
     }
 
-    private fun currentOf(address: String): GatewayDeviceState =
-        _devices.value[address] ?: GatewayDeviceState(address)
-
     companion object {
         private const val TAG = "SpotflowGateway"
         private const val SCAN_JOB_KEY = "__scan__"
         private const val INITIAL_BACKOFF_MS = 2_000L
+        private const val RECONNECT_DELAY_MS = 500L
         private const val MAX_BACKOFF_MS = 30_000L
     }
 }

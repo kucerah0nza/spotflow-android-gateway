@@ -11,6 +11,7 @@ import io.spotflow.ble.protocol.Message
 import io.spotflow.ble.protocol.MessageType
 import io.spotflow.ble.transport.BleConnection
 import io.spotflow.ble.transport.ConnectionState
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.channels.Channel
@@ -54,13 +55,25 @@ class GatewaySessionTest {
             )
         }
 
+    /** Mirrors the gateway: one status entry per address, shared by every session and cloud link. */
+    private val board = HashMap<String, GatewayDeviceState>()
+
     private fun TestScope.session(
         ble: FakeBleConnection,
         uplink: FakeUplink,
         links: CloudLinkRegistry = registry(backgroundScope, uplink),
         filter: DeviceFilter? = null,
         onStatus: (GatewayDeviceState) -> Unit = {},
-    ) = GatewaySession(ble, config, links, onStatus, filter)
+    ): GatewaySession {
+        val address = ble.deviceAddress
+        val push: StatusPush = { change ->
+            val state = synchronized(board) {
+                change(board[address] ?: GatewayDeviceState(address)).also { board[address] = it }
+            }
+            onStatus(state)
+        }
+        return GatewaySession(ble, config, links, push, filter)
+    }
 
     @Test
     fun `forwards telemetry to the ingest topic`() = runTest {
@@ -73,6 +86,18 @@ class GatewaySessionTest {
         runCurrent()
 
         assertTrue(uplink.publishedTo("ingest-cbor", byteArrayOf(1, 2, 3)))
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `follows the protocol order - reads first, TX notifications last`() = runTest {
+        val ble = FakeBleConnection()
+        val uplink = FakeUplink()
+        val job = launch { runCatching { session(ble, uplink).run() } }
+        runCurrent()
+
+        assertEquals(listOf("prepare", "capabilities", "deviceId", "metadata", "notifications"), ble.operations)
+        assertTrue("session metadata is published", uplink.publishedTo("ingest-cbor", "meta".toByteArray()))
         ble.drop(); runCurrent(); job.cancel()
     }
 
@@ -145,13 +170,68 @@ class GatewaySessionTest {
         assertTrue(job1.isCompleted)
 
         val second = FakeBleConnection()
-        val job2 = launch { session(second, uplink, links).run() }
+        var status: GatewayDeviceState? = null
+        val job2 = launch { session(second, uplink, links) { status = it }.run() }
         runCurrent()
         second.emit(Message(MessageType.TELEMETRY, byteArrayOf(8)))
         runCurrent()
 
         assertTrue(uplink.publishedTo("ingest-cbor", byteArrayOf(8)))
         assertEquals("MQTT connection is reused, not re-established", 1, uplink.connectCount)
+        assertEquals("the new session reports the reused link as connected", true, status?.cloudConnected)
+        second.drop(); runCurrent(); job2.cancel()
+    }
+
+    @Test
+    fun `a device connecting while its recovered buffer uploads reports connected`() = runTest {
+        PersistentMessageQueue(context, "test-device", 10_000).apply {
+            enqueue(1, "ingest-cbor", byteArrayOf(1))
+            close()
+        }
+        val uplink = FakeUplink()
+        val links = registry(backgroundScope, uplink)
+        links.recover("test-device")
+        runCurrent() // recovered link connects and drains; now lingering, still connected
+
+        var status: GatewayDeviceState? = null
+        val job = launch { session(FakeBleConnection(), uplink, links) { status = it }.run() }
+        runCurrent()
+
+        assertEquals(1, uplink.connectCount)
+        assertEquals(true, status?.cloudConnected)
+        job.cancel()
+    }
+
+    @Test
+    fun `buffered data survives a device reconnect while offline`() = runTest {
+        val uplink = FakeUplink().apply { failConnect = true }
+        val links = registry(backgroundScope, uplink)
+
+        val first = FakeBleConnection()
+        val job1 = launch { runCatching { session(first, uplink, links).run() } }
+        runCurrent()
+        repeat(3) { first.emit(Message(MessageType.TELEMETRY, byteArrayOf(it.toByte(), 1, 2, 3))) }
+        advanceTimeBy(2_000); runCurrent()
+        first.drop(); runCurrent()
+        assertTrue(job1.isCompleted)
+
+        // The device is slow to come back: the new session is still connecting (not yet at the claim).
+        val second = FakeBleConnection().apply { prepareGate = CompletableDeferred() }
+        var status: GatewayDeviceState? = null
+        val job2 = launch { runCatching { session(second, uplink, links) { status = it }.run() } }
+        advanceTimeBy(2_000); runCurrent()
+        assertTrue("buffer still shown while reconnecting", (status?.ramBytes ?: 0) > 0)
+
+        second.prepareGate!!.complete(Unit)
+        advanceTimeBy(2_000); runCurrent()
+        assertTrue("buffer still shown after reconnect", (status?.ramBytes ?: 0) + (status?.diskBytes ?: 0) > 0)
+
+        uplink.failConnect = false
+        advanceTimeBy(60_000); runCurrent()
+        repeat(3) {
+            assertTrue("message $it delivered", uplink.publishedTo("ingest-cbor", byteArrayOf(it.toByte(), 1, 2, 3)))
+        }
+        assertEquals("forwarded counts across the reconnect", uplink.published.size.toLong(), status?.forwarded)
         second.drop(); runCurrent(); job2.cancel()
     }
 
@@ -310,9 +390,18 @@ private class FakeBleConnection(
     val sentDesiredConfig = mutableListOf<ByteArray>()
     var failDesiredWrites = 0
 
-    override suspend fun prepare() { stateFlow.value = ConnectionState.READY }
-    override suspend fun readDeviceId() = deviceId
-    override suspend fun readSessionMetadata() = "meta".toByteArray()
+    val operations = mutableListOf<String>()
+    var prepareGate: CompletableDeferred<Unit>? = null
+    override suspend fun prepare() {
+        stateFlow.value = ConnectionState.CONNECTING
+        prepareGate?.await()
+        operations += "prepare"
+        stateFlow.value = ConnectionState.PREPARING
+    }
+    override suspend fun readProtocolVersion(): Int { operations += "capabilities"; return 1 }
+    override suspend fun startStreaming() { operations += "notifications"; stateFlow.value = ConnectionState.READY }
+    override suspend fun readDeviceId(): String { operations += "deviceId"; return deviceId }
+    override suspend fun readSessionMetadata(): ByteArray { operations += "metadata"; return "meta".toByteArray() }
     override suspend fun readRssi() = -55
     override suspend fun sendDesiredConfiguration(payload: ByteArray) {
         if (failDesiredWrites > 0) {
