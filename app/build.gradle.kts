@@ -54,6 +54,7 @@ android {
 
     buildFeatures {
         viewBinding = true
+        buildConfig = true // BuildConfig.VERSION_NAME, shown in the header
     }
 
     packaging {

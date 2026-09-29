@@ -96,6 +96,8 @@ class MainActivity : AppCompatActivity() {
             insets
         }
 
+        binding.subtitle.text = getString(R.string.subtitle, BuildConfig.VERSION_NAME)
+
         // Prefill the previously saved ingest key and buffer sizes.
         binding.ingestKey.setText(keyStore.ingestKey)
         binding.bufferRamMb.setText(keyStore.bufferRamMb.toString())
@@ -275,6 +277,7 @@ class MainActivity : AppCompatActivity() {
             appendLine(line("Signal", signal))
             appendLine(line("MQTT connection", cloud))
             appendLine(line("Forwarded", "${d.forwarded} msgs"))
+            appendLine(line("Received", "${d.received} msgs"))
             appendLine(line("Buffer RAM", humanBytes(d.ramBytes)))
             append(line("Buffer flash", humanBytes(d.diskBytes)))
         }

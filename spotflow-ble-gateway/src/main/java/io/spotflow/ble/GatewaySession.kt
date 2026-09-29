@@ -6,6 +6,7 @@ import io.spotflow.ble.protocol.MessageType
 import io.spotflow.ble.transport.BleConnection
 import io.spotflow.ble.transport.ConnectionState
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -21,6 +22,12 @@ data class GatewayDeviceState(
     val cloudConnected: Boolean = false,
     /** Messages delivered to the cloud for this device since the gateway started (across reconnects). */
     val forwarded: Long = 0,
+    /**
+     * Messages received from the cloud for this device (desired configuration, e.g. a new minimal log
+     * severity) since the gateway started, across reconnects — counted on arrival, before they are
+     * written to the device.
+     */
+    val received: Long = 0,
     /** Latest BLE signal strength in dBm (higher/closer to 0 is stronger), or null if not yet read. */
     val rssi: Int? = null,
     /** Bytes buffered in the in-memory tier (normal while briefly offline). */
@@ -110,12 +117,22 @@ internal class GatewaySession(
                     Log.w(TAG, "session metadata unavailable for $deviceId: ${t.message}")
                 }
 
+                // Completed by the device's first reported configuration this session. The Device SDK
+                // registers its desired-configuration handler just before sending that message; until
+                // then it accepts RX writes but silently discards them.
+                val deviceAcceptsConfiguration = CompletableDeferred<Unit>()
+
                 // BLE -> buffer (RAM first; never blocks on the network).
                 val pump = launch {
                     connection.incoming.collect { message ->
                         val topic = when (message.type) {
                             MessageType.TELEMETRY -> mqttConfig.topics.ingest
-                            MessageType.REPORTED_CONFIGURATION -> mqttConfig.topics.reportedConfiguration
+                            MessageType.REPORTED_CONFIGURATION -> {
+                                if (deviceAcceptsConfiguration.complete(Unit)) {
+                                    Log.i(TAG, "$deviceId reported its configuration; desired configuration can be delivered")
+                                }
+                                mqttConfig.topics.reportedConfiguration
+                            }
                             else -> return@collect
                         }
                         link.enqueue(topic, message.payload)
@@ -125,8 +142,11 @@ internal class GatewaySession(
                 // Buffer -> MQTT, owning connect/reconnect so offline just keeps buffering.
                 val drainer = launch { link.drain(stopWhenEmpty = false) }
 
-                // Cloud -> device, in order, acknowledged to the broker only once written.
+                // Cloud -> device, in order, acknowledged to the broker only once written — and only once
+                // the device can take it (see above). A device that never reports configuration doesn't
+                // support it, so pending desired configuration then stays queued rather than being lost.
                 val desired = launch {
+                    deviceAcceptsConfiguration.await()
                     link.deliverDesiredConfiguration { connection.sendDesiredConfiguration(it) }
                 }
 

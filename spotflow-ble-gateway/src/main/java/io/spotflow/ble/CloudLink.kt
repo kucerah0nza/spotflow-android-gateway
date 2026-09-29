@@ -61,7 +61,12 @@ internal class CloudLink(
 
     init {
         uplink.desiredConfigurationHandler = { payload, ack ->
-            synchronized(desiredLock) { pendingDesired.addLast(PendingDesired(payload, ack)) }
+            val queued = synchronized(desiredLock) {
+                pendingDesired.addLast(PendingDesired(payload, ack))
+                pendingDesired.size
+            }
+            Log.i(TAG, "desired configuration for $deviceId received (${payload.size} bytes, $queued pending)")
+            push { it.copy(received = it.received + 1) }
             desiredSignal.trySend(Unit)
         }
     }
@@ -173,6 +178,7 @@ internal class CloudLink(
             }
             val done = try {
                 write(head.payload)
+                Log.i(TAG, "desired configuration written to $deviceId (${head.payload.size} bytes)")
                 true
             } catch (c: CancellationException) {
                 throw c

@@ -2,6 +2,7 @@ package io.spotflow.ble.cloud
 
 import android.util.Log
 import com.hivemq.client.mqtt.MqttClient
+import com.hivemq.client.mqtt.MqttGlobalPublishFilter
 import com.hivemq.client.mqtt.mqtt5.Mqtt5AsyncClient
 import com.hivemq.client.mqtt.mqtt5.exceptions.Mqtt5ConnAckException
 import com.hivemq.client.mqtt.mqtt5.message.connect.connack.Mqtt5ConnAckReasonCode
@@ -56,7 +57,12 @@ class MqttUplink(
         if (config.useTls) {
             builder = builder.sslWithDefaultConfig()
         }
-        return builder.buildAsync()
+        return builder.buildAsync().also { client ->
+            // Registered before connecting and for ALL messages, with manual acknowledgement: the broker
+            // redelivers queued desired configuration right after CONNACK — before our SUBACK — and on
+            // a per-device topic that doesn't match our filter under MQTT rules (see onCloudMessage).
+            client.publishes(MqttGlobalPublishFilter.ALL, ::onCloudMessage, true)
+        }
     }
 
     /**
@@ -79,13 +85,19 @@ class MqttUplink(
 
             // Subscribe inside the same try: a subscribe failure must not leave the client connected
             // but unsubscribed (which would silently break the desired-config downlink).
-            client.subscribeWith()
+            // No per-subscription callback: messages are handled by the global handler registered in
+            // buildClient() (see onCloudMessage for why).
+            val subAck = client.subscribeWith()
                 .topicFilter(config.topics.desiredConfiguration)
                 .qos(config.qos)
-                .callback(::onCloudMessage)
-                .manualAcknowledgement(true)
                 .send()
                 .await()
+            // The broker answers per topic filter; a refusal still completes the SUBACK normally.
+            val reasons = subAck.reasonCodes
+            Log.i(TAG, "subscribed $deviceId to '${config.topics.desiredConfiguration}': $reasons")
+            if (reasons.any { it.isError }) {
+                throw MqttConnectException("Broker refused the desired-configuration subscription ($reasons)")
+            }
         } catch (t: Throwable) {
             // Ensure we never leave a half-established connection; force a clean reconnect next time.
             runCatching { client.disconnect().await() }
@@ -107,7 +119,20 @@ class MqttUplink(
         runCatching { client.disconnect().await() }
     }
 
+    /**
+     * The broker accepts a subscription to `config-cbor-c2d` but publishes desired configuration on a
+     * per-device topic below it (seen: `config-cbor-c2d/<workspace>/<device>`), which that filter doesn't
+     * match under MQTT rules. Like the Device SDK, anything under the desired-configuration topic is
+     * treated as desired configuration.
+     */
     private fun onCloudMessage(publish: Mqtt5Publish) {
+        val topic = publish.topic.toString()
+        if (!isDesiredConfigurationTopic(config.topics.desiredConfiguration, topic)) {
+            Log.w(TAG, "ignoring message for $deviceId on unexpected topic '$topic'")
+            runCatching { publish.acknowledge() } // nothing to deliver; don't leave it pending
+            return
+        }
+        Log.i(TAG, "desired configuration for $deviceId on '$topic' (${publish.payloadAsBytes.size} bytes)")
         // No handler: leave it unacknowledged so the broker redelivers it rather than it being lost.
         val handler = desiredConfigurationHandler ?: return
         handler(publish.payloadAsBytes) { runCatching { publish.acknowledge() } }
@@ -140,6 +165,10 @@ class MqttUplink(
     }
 
     companion object {
+        /** Whether [topic] carries desired configuration: [base] itself or any topic below it. */
+        internal fun isDesiredConfigurationTopic(base: String, topic: String): Boolean =
+            topic == base || topic.startsWith("$base/")
+
         private const val TAG = "SpotflowMqtt"
         private const val SESSION_EXPIRY_SECONDS = 3600L
     }
