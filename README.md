@@ -73,8 +73,14 @@ devices never come back.
 - **Cloud** — one MQTT-over-TLS connection per device to `mqtt.spotflow.io:8883`, QoS 1, with MQTT
   `username = device ID` and `password = ingest key`. TLS is validated by the Android system trust store
   (Let's Encrypt ISRG Root X1 — no bundled CA). Telemetry and session metadata publish to `ingest-cbor`,
-  reported configuration to `config-cbor-d2c`; desired configuration is received from `config-cbor-c2d`
-  and written down the RX Stream, in order, and acknowledged to the broker only once written.
+  reported configuration to `config-cbor-d2c`; desired configuration (e.g. the minimal log severity set
+  in the portal) is received from `config-cbor-c2d` and written down the RX Stream, in order, and
+  acknowledged to the broker only once written.
+- **Desired configuration details** — the broker publishes it on a per-device topic *below* the
+  subscribed one (`config-cbor-c2d/<workspace>/<device>`), so, like the Device SDK, the gateway matches
+  the topic by prefix. It is written only after the device has sent its reported configuration in the
+  current session: the Device SDK discards desired configuration that arrives earlier. Until then it
+  stays queued and unacknowledged, so nothing is lost while the device is away.
 - **Delivery** is at-least-once: a publish that timed out or was cut off by a disconnect may arrive twice.
 - **Reassembly** only delivers a message whose size matches the length declared in its first fragment;
   a message with a lost fragment is dropped rather than forwarded truncated.

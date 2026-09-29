@@ -296,7 +296,8 @@ class GatewaySessionTest {
     fun `desired configuration is written in order and acknowledged after the write`() = runTest {
         val ble = FakeBleConnection()
         val uplink = FakeUplink()
-        val job = launch { runCatching { session(ble, uplink).run() } }
+        var status: GatewayDeviceState? = null
+        val job = launch { runCatching { session(ble, uplink) { status = it }.run() } }
         runCurrent()
 
         val acks = mutableListOf<Int>()
@@ -306,7 +307,54 @@ class GatewaySessionTest {
 
         assertEquals(listOf(1, 2), ble.sentDesiredConfig.map { it[0].toInt() })
         assertEquals(listOf(1, 2), acks)
+        assertEquals("both counted as received", 2L, status?.received)
         ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `desired configuration waits until the device has reported its configuration`() = runTest {
+        val ble = FakeBleConnection().apply { reportsConfiguration = false }
+        val uplink = FakeUplink()
+        val job = launch { runCatching { session(ble, uplink).run() } }
+        runCurrent()
+
+        var acked = false
+        uplink.deliverDesired(byteArrayOf(3)) { acked = true }
+        advanceTimeBy(10_000); runCurrent()
+        assertTrue("not written before the device can accept it", ble.sentDesiredConfig.isEmpty())
+        assertFalse("not acknowledged, so it isn't lost", acked)
+
+        ble.reportConfiguration()
+        runCurrent()
+        assertTrue(ble.sentDesiredConfig.any { it.contentEquals(byteArrayOf(3)) })
+        assertTrue(acked)
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `desired configuration queued while the device was away is delivered after it reports`() = runTest {
+        val uplink = FakeUplink()
+        val links = registry(backgroundScope, uplink)
+        val first = FakeBleConnection()
+        val job1 = launch { runCatching { session(first, uplink, links).run() } }
+        runCurrent()
+        first.drop(); runCurrent()
+
+        var acked = false
+        uplink.deliverDesired(byteArrayOf(5)) { acked = true } // arrives while the device is disconnected
+        runCurrent()
+
+        val second = FakeBleConnection().apply { reportsConfiguration = false }
+        val job2 = launch { runCatching { session(second, uplink, links).run() } }
+        runCurrent()
+        assertTrue("held until the rebooted device reports", second.sentDesiredConfig.isEmpty())
+        assertFalse(acked)
+
+        second.reportConfiguration()
+        runCurrent()
+        assertTrue(second.sentDesiredConfig.any { it.contentEquals(byteArrayOf(5)) })
+        assertTrue(acked)
+        second.drop(); runCurrent(); job1.cancel(); job2.cancel()
     }
 
     @Test
@@ -399,7 +447,14 @@ private class FakeBleConnection(
         stateFlow.value = ConnectionState.PREPARING
     }
     override suspend fun readProtocolVersion(): Int { operations += "capabilities"; return 1 }
-    override suspend fun startStreaming() { operations += "notifications"; stateFlow.value = ConnectionState.READY }
+    /** Like the Device SDK: once notifications are on, the device sends its reported configuration. */
+    var reportsConfiguration = true
+    override suspend fun startStreaming() {
+        operations += "notifications"
+        stateFlow.value = ConnectionState.READY
+        if (reportsConfiguration) reportConfiguration()
+    }
+    fun reportConfiguration() { emit(Message(MessageType.REPORTED_CONFIGURATION, byteArrayOf(0x7E))) }
     override suspend fun readDeviceId(): String { operations += "deviceId"; return deviceId }
     override suspend fun readSessionMetadata(): ByteArray { operations += "metadata"; return "meta".toByteArray() }
     override suspend fun readRssi() = -55
