@@ -16,8 +16,9 @@ import io.spotflow.ble.cloud.CredentialsProvider
 import io.spotflow.ble.cloud.MqttAuthException
 import io.spotflow.ble.cloud.MqttConfig
 import io.spotflow.ble.cloud.MqttUplink
-import io.spotflow.ble.cloud.PersistentMessageQueue
-import io.spotflow.ble.cloud.StoreAndForwardBuffer
+import io.spotflow.ble.cloud.BufferPool
+import io.spotflow.ble.cloud.BufferUsage
+import io.spotflow.ble.cloud.MessageStore
 import io.spotflow.ble.transport.AttachedBleConnection
 import io.spotflow.ble.transport.BleConnection
 import io.spotflow.ble.transport.ConnectionState
@@ -76,15 +77,18 @@ class SpotflowGateway(
     /** Addresses whose status is published; a status update for any other address is ignored. */
     private val tracked = ConcurrentHashMap.newKeySet<String>()
 
+    /** One RAM and one flash budget shared by every device (see [BufferPool]). */
+    private val buffers: BufferPool = run {
+        val flashMaxBytes = (mqttConfig.bufferMaxBytes - mqttConfig.ramBufferMaxBytes).coerceAtLeast(0)
+        val store = MessageStore.acquire(appContext, flashMaxBytes)
+        BufferPool(store, mqttConfig.ramBufferMaxBytes, flashMaxBytes) { MessageStore.release(store) }
+    }
+
+    /** Live usage of the store-and-forward budget, across all devices (see [MqttConfig.bufferMaxBytes]). */
+    val bufferUsage: StateFlow<BufferUsage> get() = buffers.usage
+
     private val links = CloudLinkRegistry(scope) { deviceId, push ->
-        val diskMaxBytes = (mqttConfig.bufferMaxBytes - mqttConfig.ramBufferMaxBytes).coerceAtLeast(0)
-        val disk = if (diskMaxBytes > 0) PersistentMessageQueue(appContext, deviceId, diskMaxBytes) else null
-        CloudLink(
-            deviceId,
-            StoreAndForwardBuffer(disk, mqttConfig.ramBufferMaxBytes),
-            MqttUplink(deviceId, credentials, mqttConfig),
-            push,
-        )
+        CloudLink(deviceId, buffers.open(deviceId), MqttUplink(deviceId, credentials, mqttConfig), push)
     }
 
     private val _devices = MutableStateFlow<Map<String, GatewayDeviceState>>(emptyMap())
@@ -104,7 +108,7 @@ class SpotflowGateway(
         // Upload buffers left on disk by an earlier run (e.g. the app was killed during an outage) even if
         // those devices never come back.
         scope.launch {
-            runCatching { PersistentMessageQueue.storedDeviceIds(appContext) }.getOrDefault(emptyList())
+            runCatching { buffers.storedDeviceIds() }.getOrDefault(emptyList())
                 .forEach { id -> runCatching { links.recover(id) } }
         }
     }
@@ -309,6 +313,8 @@ class SpotflowGateway(
         jobs.values.forEach { it.cancel() }
         jobs.clear()
         scope.cancel()
+        // The flash store closes once every link has flushed and closed its buffer.
+        buffers.shutdown()
     }
 
     /**

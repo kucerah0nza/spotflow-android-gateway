@@ -30,6 +30,8 @@ data class GatewayDeviceState(
     val received: Long = 0,
     /** Latest BLE signal strength in dBm (higher/closer to 0 is stronger), or null if not yet read. */
     val rssi: Int? = null,
+    /** Messages buffered for this device, waiting to be uploaded (RAM and flash). */
+    val pendingMessages: Long = 0,
     /** Bytes buffered in the in-memory tier (normal while briefly offline). */
     val ramBytes: Long = 0,
     /** Bytes spilled to the persistent (flash) tier (only after a longer outage). */

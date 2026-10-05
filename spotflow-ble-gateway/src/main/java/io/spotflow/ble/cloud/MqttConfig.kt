@@ -24,18 +24,21 @@ data class MqttConfig(
     val qos: MqttQos = MqttQos.AT_LEAST_ONCE,
     val topics: SpotflowTopics = SpotflowTopics(),
     /**
-     * Max total size of the store-and-forward buffer per device, in bytes (RAM tier + disk tier).
-     * Messages received over BLE are buffered here and drained to MQTT when the network is available;
-     * when the buffer is full the oldest messages are evicted. Default 50 MiB. If this is not larger than
-     * [ramBufferMaxBytes] there is no flash tier: the buffer is RAM-only and never writes to flash.
+     * Max size of the store-and-forward buffer for the whole gateway — all devices together — in bytes
+     * (RAM tier + flash tier). Messages received over BLE are buffered here and drained to MQTT when the
+     * network is available. When it is full, the device holding the most data loses its oldest messages
+     * first, so one flooding or long-offline device can't push out the others. Default 50 MiB. If this is
+     * not larger than [ramBufferMaxBytes] there is no flash tier: the buffer is RAM-only and never writes
+     * to flash.
      */
     val bufferMaxBytes: Long = 50L * 1024 * 1024,
 
     /**
-     * Size of the in-memory (RAM) tier of the buffer, in bytes. In steady-state (online) operation data
-     * flows through RAM only, so flash is not written; the buffer spills the oldest messages to the disk
-     * tier only once RAM fills up (i.e. connectivity has been down long enough to accumulate a backlog).
-     * The trade-off is that data still in RAM is lost if the process is killed. Default 1 MiB.
+     * Size of the in-memory (RAM) tier for the whole gateway, in bytes. In steady-state (online) operation
+     * data flows through RAM only, so flash is not written; the oldest messages of the device holding the
+     * most RAM spill to the flash tier only once RAM fills up (i.e. connectivity has been down long enough
+     * to accumulate a backlog). The trade-off is that data still in RAM is lost if the process is killed.
+     * Default 1 MiB.
      */
     val ramBufferMaxBytes: Long = 1L * 1024 * 1024,
 )

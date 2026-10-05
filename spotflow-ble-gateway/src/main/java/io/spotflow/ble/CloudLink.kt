@@ -68,6 +68,8 @@ internal class CloudLink(
     private var lastWrittenDesired: ByteArray? = null
 
     init {
+        // Another device's data can push this device's out of RAM (to flash) or out of flash (evicted).
+        buffer.onExternalChange = { pushBuffer() }
         uplink.desiredConfigurationHandler = { payload, ack ->
             val queued = synchronized(desiredLock) {
                 pendingDesired.addLast(PendingDesired(payload, ack))
@@ -226,13 +228,14 @@ internal class CloudLink(
     }
 
     /**
-     * Persists anything still in RAM, disconnects, and closes the buffer (deleting its file if empty).
-     * Flushing comes first so a process kill during the (network-bound) disconnect loses nothing.
+     * Persists anything still in RAM, disconnects, and closes the buffer. Flushing comes first so a
+     * process kill during the (network-bound) disconnect loses nothing.
      */
     suspend fun close() = withContext(NonCancellable) {
         runCatching { buffer.flushToDisk() }
         pushBuffer()
         uplink.desiredConfigurationHandler = null
+        buffer.onExternalChange = null
         runCatching { uplink.disconnect() }
         push { it.copy(cloudConnected = false) }
         runCatching { buffer.close() }
@@ -240,12 +243,14 @@ internal class CloudLink(
 
     private fun publishSnapshot() {
         val connected = uplink.isConnected
+        val pending = buffer.count
         val ram = buffer.ramBytes
         val disk = buffer.diskBytes
         push {
             it.copy(
                 cloudConnected = connected,
                 error = if (connected) null else it.error,
+                pendingMessages = pending,
                 ramBytes = ram,
                 diskBytes = disk,
             )
@@ -253,9 +258,10 @@ internal class CloudLink(
     }
 
     private fun pushBuffer() {
+        val pending = buffer.count
         val ram = buffer.ramBytes
         val disk = buffer.diskBytes
-        push { it.copy(ramBytes = ram, diskBytes = disk) }
+        push { it.copy(pendingMessages = pending, ramBytes = ram, diskBytes = disk) }
     }
 
     private companion object {
