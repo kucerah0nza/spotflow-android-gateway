@@ -64,7 +64,25 @@ class SpotflowGatewayService : Service() {
         onReady?.invoke(instance)
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_RESTART) restartGateway()
+        return START_STICKY
+    }
+
+    /**
+     * Replaces the gateway with a fresh one from [gatewayFactory] — e.g. to apply new settings — while the
+     * service stays in the foreground. Devices in range reconnect within seconds, and data the old gateway
+     * still held is flushed to flash and picked up by the new one, so relaying pauses only briefly.
+     */
+    private fun restartGateway() {
+        val factory = gatewayFactory ?: return
+        Log.i(TAG, "restarting the gateway")
+        gateway?.shutdown()
+        gateway = null
+        val instance = factory(this)
+        gateway = instance
+        onReady?.invoke(instance)
+    }
 
     override fun onDestroy() {
         gateway?.shutdown()
@@ -102,6 +120,7 @@ class SpotflowGatewayService : Service() {
         private const val TAG = "SpotflowGateway"
         const val CHANNEL_ID = "spotflow_gateway"
         private const val NOTIFICATION_ID = 4711
+        private const val ACTION_RESTART = "io.spotflow.ble.action.RESTART_GATEWAY"
 
         /** Builds the [SpotflowGateway] the service will host. Required. */
         @Volatile
@@ -125,6 +144,19 @@ class SpotflowGatewayService : Service() {
 
         fun start(context: Context) {
             ContextCompat.startForegroundService(context, Intent(context, SpotflowGatewayService::class.java))
+        }
+
+        /**
+         * Restarts a running gateway in place (see [gatewayFactory]), much faster than [stop] + [start]
+         * since the service never leaves the foreground. Starts it if it isn't running. Call it while the
+         * app is in the foreground, as Android limits starting services from the background.
+         */
+        fun restart(context: Context) {
+            if (gateway == null) {
+                start(context)
+            } else {
+                context.startService(Intent(context, SpotflowGatewayService::class.java).setAction(ACTION_RESTART))
+            }
         }
 
         fun stop(context: Context) {

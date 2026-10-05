@@ -4,8 +4,8 @@ import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import io.spotflow.ble.cloud.MqttAuthException
 import io.spotflow.ble.cloud.MqttConfig
-import io.spotflow.ble.cloud.PersistentMessageQueue
-import io.spotflow.ble.cloud.StoreAndForwardBuffer
+import io.spotflow.ble.cloud.BufferPool
+import io.spotflow.ble.cloud.MessageStore
 import io.spotflow.ble.cloud.Uplink
 import io.spotflow.ble.protocol.Message
 import io.spotflow.ble.protocol.MessageType
@@ -45,15 +45,18 @@ class GatewaySessionTest {
         context.databaseList().forEach { context.deleteDatabase(it) }
     }
 
-    private fun registry(scope: CoroutineScope, uplink: FakeUplink, diskMaxBytes: Long = 10_000) =
-        CloudLinkRegistry(scope) { deviceId, push ->
-            CloudLink(
-                deviceId,
-                StoreAndForwardBuffer(PersistentMessageQueue(context, deviceId, diskMaxBytes), 1_000),
-                uplink,
-                push,
-            )
-        }
+    /** The flash store, opened after setUp() cleared the databases. */
+    private val store by lazy { MessageStore(context, 10_000) }
+
+    private fun registry(scope: CoroutineScope, uplink: FakeUplink): CloudLinkRegistry {
+        val pool = BufferPool(store, ramMaxBytes = 1_000, flashMaxBytes = 10_000)
+        return CloudLinkRegistry(scope) { deviceId, push -> CloudLink(deviceId, pool.open(deviceId), uplink, push) }
+    }
+
+    /** Leaves [payload] on flash for [deviceId], as a run that was killed during an outage would. */
+    private fun leaveOnFlash(deviceId: String, payload: ByteArray) {
+        store.enqueueAll(deviceId, listOf(MessageStore.Entry(1, "ingest-cbor", payload)))
+    }
 
     /** Mirrors the gateway: one status entry per address, shared by every session and cloud link. */
     private val board = HashMap<String, GatewayDeviceState>()
@@ -128,6 +131,7 @@ class GatewaySessionTest {
 
         assertTrue("nothing should publish while offline", uplink.published.isEmpty())
         assertTrue("data should be buffered in RAM", (last?.ramBytes ?: 0) > 0)
+        assertTrue("and counted as waiting", (last?.pendingMessages ?: 0) > 0)
 
         uplink.failConnect = false
         advanceTimeBy(30_000); runCurrent()
@@ -135,6 +139,7 @@ class GatewaySessionTest {
         assertTrue("buffer should flush once online", uplink.published.isNotEmpty())
         assertEquals(0L, last?.ramBytes)
         assertEquals(0L, last?.diskBytes)
+        assertEquals(0L, last?.pendingMessages)
         ble.drop(); runCurrent(); job.cancel()
     }
 
@@ -184,10 +189,7 @@ class GatewaySessionTest {
 
     @Test
     fun `a device connecting while its recovered buffer uploads reports connected`() = runTest {
-        PersistentMessageQueue(context, "test-device", 10_000).apply {
-            enqueue(1, "ingest-cbor", byteArrayOf(1))
-            close()
-        }
+        leaveOnFlash("test-device", byteArrayOf(1))
         val uplink = FakeUplink()
         val links = registry(backgroundScope, uplink)
         links.recover("test-device")
@@ -454,18 +456,15 @@ class GatewaySessionTest {
 
     @Test
     fun `recover drains a buffer left on disk by an earlier run`() = runTest {
-        PersistentMessageQueue(context, "orphan", 10_000).apply {
-            enqueue(1, "ingest-cbor", byteArrayOf(4, 2))
-            close()
-        }
-        assertEquals(listOf("orphan"), PersistentMessageQueue.storedDeviceIds(context))
+        leaveOnFlash("orphan", byteArrayOf(4, 2))
+        assertEquals(listOf("orphan"), store.storedDeviceIds())
 
         val uplink = FakeUplink()
         registry(backgroundScope, uplink).recover("orphan")
         advanceTimeBy(60_000); runCurrent()
 
         assertTrue(uplink.publishedTo("ingest-cbor", byteArrayOf(4, 2)))
-        assertTrue("drained buffer file is deleted", PersistentMessageQueue.storedDeviceIds(context).isEmpty())
+        assertTrue("nothing left on flash", store.storedDeviceIds().isEmpty())
     }
 }
 
