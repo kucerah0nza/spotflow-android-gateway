@@ -22,11 +22,16 @@ Spotflow.
 
 ### Demo app
 
-Enter an ingest key, optionally size the buffer (RAM and flash, in MB), and tap **Start**. The app runs
-the gateway in the foreground service and lists every device it relays with its BLE and MQTT state,
-signal strength, buffered bytes, **Forwarded** (messages delivered to the cloud) and **Received**
-(desired configuration received from the cloud, e.g. a log-severity change made in the portal). The
-header shows the app version. The ingest key is stored encrypted with the Android Keystore, and a
+Open **Settings** (gear icon, top right), enter an ingest key, optionally size the buffer (RAM and flash,
+in MB, shared by all devices), and tap **Save**; then tap **Start**. Settings can be changed while the
+gateway runs: it keeps relaying with the old ones, and the main screen offers a **Restart** that applies
+them within seconds (instead of a Stop/edit/Start round that leaves devices waiting). The app runs the gateway in the foreground service and the main screen
+lists every device it relays — tap a name to collapse or expand its details — with a status marker (green
+when relaying), its BLE and MQTT state, signal strength, messages waiting to upload, **Forwarded**
+(messages delivered to the cloud) and **Received** (desired configuration received from the cloud, e.g. a
+log-severity change made in the portal). The
+header shows the app version, and a line under **Devices** shows the gateway-wide buffer use against the
+limits in Settings (amber above 80%). The ingest key is stored encrypted with the Android Keystore, and a
 gateway left running resumes by itself after the app is updated or the phone reboots.
 
 ## How it works
@@ -105,8 +110,9 @@ devices never come back.
 - `transport/` — `BleConnection` (with `ManagedBleConnection` / `AttachedBleConnection`),
   `SpotflowGattSession` (serialized GATT command queue + callback bridge), `SpotflowScanner`.
 - `cloud/` — `MqttUplink`, `MqttConfig` / `SpotflowTopics`, `CredentialsProvider` + `StaticIngestKey`,
-  `StoreAndForwardBuffer` (the two-tier RAM+flash buffer) backed by `PersistentMessageQueue` (its SQLite
-  flash tier), `MqttAuthException` / `MqttConnectException`.
+  `StoreAndForwardBuffer` (a device's two-tier RAM+flash queue) within `BufferPool` (the gateway-wide
+  RAM and flash budget), backed by `MessageStore` (the shared SQLite flash tier),
+  `MqttAuthException` / `MqttConnectException`.
 - `SpotflowGateway`, `GatewaySession` (BLE side), `CloudLink` / `CloudLinkRegistry` (per-device cloud
   side that outlives BLE sessions), `DeviceFilter` — orchestration.
 - `service/SpotflowGatewayService` — foreground service (`connectedDevice`).
@@ -157,6 +163,10 @@ SpotflowGatewayService.onReady = { it.startScanning() }
 SpotflowGatewayService.start(context)
 ```
 
+To apply new settings, update the hooks and call `SpotflowGatewayService.restart(context)`: it replaces
+the gateway in place while the service stays in the foreground, so relaying pauses only while devices
+reconnect (data the old gateway held is flushed to flash and delivered by the new one).
+
 It runs as foreground service type `connectedDevice` with a persistent (customizable) notification. For a
 dedicated always-on gateway, also guide users to disable battery optimization (Doze) for the app.
 
@@ -186,13 +196,20 @@ flowchart TD
 - **Store-and-forward buffer** — a two-tier buffer keeps diagnostics flowing through outages without
   wearing the flash. In steady state messages flow through a small **RAM tier only** (no disk writes);
   once the RAM tier fills (`ramBufferMaxBytes`, default 1 MiB — i.e. the network has been down a while) the
-  oldest messages **spill to a crash-safe, byte-bounded per-device SQLite tier** that survives the app
-  being killed or the phone rebooting. Spills are written in batches (one transaction each), so an
-  outage costs occasional flash writes rather than one per message. Total size is bounded by
-  `bufferMaxBytes` (default 50 MiB), evict-oldest when full, and everything drains in FIFO order once
-  connectivity returns — whether or not the device is still connected. With `bufferMaxBytes` ≤
-  `ramBufferMaxBytes` there is no flash tier at all (RAM-only). Trade-off: data still in the RAM tier is
-  lost if the process is killed.
+  oldest messages **spill to a crash-safe, byte-bounded SQLite tier** that survives the app being killed
+  or the phone rebooting. Spills are written in batches (one transaction each), so an outage costs
+  occasional flash writes rather than one per message. Total size is bounded by `bufferMaxBytes` (default
+  50 MiB), and everything drains in FIFO order once connectivity returns — whether or not the device is
+  still connected. With `bufferMaxBytes` ≤ `ramBufferMaxBytes` there is no flash tier at all (RAM-only).
+  Trade-off: data still in the RAM tier is lost if the process is killed.
+- **Shared budget, fair eviction** — both limits apply to the **whole gateway**, however many devices it
+  relays, so its footprint is predictable. Each device still has its own queue (it uploads over its own
+  MQTT connection, in its own order, and one device's outage never blocks another's uploads), but all
+  queues draw on the same budget: when RAM is full, the device holding the most RAM spills first; when
+  flash is full, the device holding the most flash loses its oldest messages first. A device that floods
+  the buffer or stays offline for long therefore gives up its own data before anyone else's. All devices
+  share one database (`spotflow_buffer.db`); buffers in the per-device files of versions before 0.1.8 are
+  moved into it on first start.
 - **Bluetooth off/on** — the gateway watches the Bluetooth adapter itself, so turning Bluetooth off and
   back on tears down and re-establishes sessions automatically — even with the screen off, since it runs in
   the foreground service. (Turning Bluetooth off often doesn't deliver a GATT disconnect callback, which
@@ -210,8 +227,8 @@ val gateway = SpotflowGateway(
     context,
     credentials = StaticIngestKey(key),   // or implement CredentialsProvider for rotation / per-device keys
     mqttConfig = MqttConfig(
-        bufferMaxBytes = 50L * 1024 * 1024,     // total store-and-forward buffer (RAM + flash)
-        ramBufferMaxBytes = 1L * 1024 * 1024,   // RAM tier; spills to flash only past this
+        bufferMaxBytes = 50L * 1024 * 1024,     // store-and-forward buffer, all devices (RAM + flash)
+        ramBufferMaxBytes = 1L * 1024 * 1024,   // RAM tier, all devices; spills to flash only past this
         // host / port / qos / topics are configurable; defaults target production
     ),
 )
@@ -258,9 +275,9 @@ workflow refuses to publish.
 ## Testing
 
 1. **Unit (no hardware):** `FrameCodecTest` covers fragmentation/reassembly incl. the 23-byte MTU,
-   multi-fragment messages, and malformed or incomplete input; `PersistentMessageQueueTest` and
-   `StoreAndForwardBufferTest` cover the two-tier buffer (FIFO across tiers, eviction, schema upgrade,
-   RAM-only mode); `GatewaySessionTest` covers the orchestration against fake BLE/MQTT (offline buffering,
+   multi-fragment messages, and malformed or incomplete input; `MessageStoreTest` and
+   `StoreAndForwardBufferTest` cover the buffer (FIFO across tiers, the shared budget and fair eviction
+   across devices, migration from per-device files, RAM-only mode); `GatewaySessionTest` covers the orchestration against fake BLE/MQTT (offline buffering,
    uploading after disconnect, link hand-over, device filter, poison messages, desired configuration
    incl. its re-send after a device reboot, recovering buffers from an earlier run); `MqttUplinkTest`
    covers desired-configuration topic matching.

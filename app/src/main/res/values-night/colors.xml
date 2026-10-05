@@ -1,0 +1,6 @@
+<resources>
+    <!-- Lighter shades that stay readable on the dark background -->
+    <color name="status_ok">#66BB6A</color>
+    <color name="status_pending">#FFB74D</color>
+    <color name="status_error">#EF5350</color>
+</resources>

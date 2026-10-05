@@ -23,22 +23,29 @@ class GatewayApp : Application() {
     override fun onCreate() {
         super.onCreate()
         val store = IngestKeyStore(this)
-        val key = store.ingestKey
-        if (store.gatewayEnabled && !key.isNullOrBlank()) {
-            configureGatewayService(key, store.bufferRamMb, store.bufferFlashMb)
-        }
+        if (store.gatewayEnabled) configureGatewayService(store)
     }
 }
 
-/** Points [SpotflowGatewayService] at a gateway built from these settings. */
-fun configureGatewayService(key: String, ramMb: Int, flashMb: Int) {
-    val ramBytes = ramMb.toLong() * 1024L * 1024L
-    val flashBytes = flashMb.toLong() * 1024L * 1024L
-    val config = MqttConfig(bufferMaxBytes = ramBytes + flashBytes, ramBufferMaxBytes = ramBytes)
-    SpotflowGatewayService.gatewayFactory = { ctx -> SpotflowGateway(ctx, StaticIngestKey(key), config) }
+/**
+ * Points [SpotflowGatewayService] at a gateway built from the saved settings, read whenever the service
+ * creates one — so a restart picks up settings saved since. Records which settings each gateway was built
+ * with, so the UI can tell when saved changes still need a restart. Returns false if no key is saved.
+ */
+fun configureGatewayService(store: IngestKeyStore): Boolean {
+    if (store.ingestKey.isNullOrBlank()) return false
+    SpotflowGatewayService.gatewayFactory = { ctx ->
+        val key = store.ingestKey.orEmpty()
+        val ramBytes = store.bufferRamMb.toLong() * 1024L * 1024L
+        val flashBytes = store.bufferFlashMb.toLong() * 1024L * 1024L
+        val config = MqttConfig(bufferMaxBytes = ramBytes + flashBytes, ramBufferMaxBytes = ramBytes)
+        store.appliedSettings = store.settingsFingerprint
+        SpotflowGateway(ctx, StaticIngestKey(key), config)
+    }
     SpotflowGatewayService.onReady = { gateway ->
         runCatching { gateway.startScanning() } // SecurityException if BLE permissions were revoked
     }
+    return true
 }
 
 /** Whether the Bluetooth permissions the gateway needs are currently granted. */
@@ -60,13 +67,11 @@ fun hasGatewayPermissions(context: Context): Boolean {
 fun resumeGatewayIfEnabled(context: Context, store: IngestKeyStore = IngestKeyStore(context)): Boolean {
     if (!store.gatewayEnabled) return false
     if (SpotflowGatewayService.gateway != null) return true
-    val key = store.ingestKey
-    if (key.isNullOrBlank() || !hasGatewayPermissions(context)) {
+    if (!hasGatewayPermissions(context) || !configureGatewayService(store)) {
         Log.w("GatewayApp", "gateway was enabled but can't resume (missing key or permissions)")
         store.gatewayEnabled = false
         return false
     }
-    configureGatewayService(key, store.bufferRamMb, store.bufferFlashMb)
     return runCatching { SpotflowGatewayService.start(context) }
         .onFailure { Log.w("GatewayApp", "cannot start gateway service: ${it.message}") }
         .isSuccess
