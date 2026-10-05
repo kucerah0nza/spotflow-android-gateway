@@ -1,0 +1,6 @@
+<resources>
+    <!-- Device status markers in the device list -->
+    <color name="status_ok">#2E7D32</color>
+    <color name="status_pending">#B26A00</color>
+    <color name="status_error">#C62828</color>
+</resources>

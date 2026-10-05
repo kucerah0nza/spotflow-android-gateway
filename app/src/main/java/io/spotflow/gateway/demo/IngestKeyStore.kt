@@ -7,6 +7,7 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import android.util.Log
 import java.security.KeyStore
+import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -55,6 +56,26 @@ class IngestKeyStore(context: Context) {
         get() = prefs.getBoolean(KEY_ENABLED, false)
         set(value) = prefs.edit().putBoolean(KEY_ENABLED, value).apply()
 
+    /**
+     * Identifies the saved settings without revealing the key (it is hashed), so they can be compared
+     * with [appliedSettings].
+     */
+    val settingsFingerprint: String
+        get() {
+            val keyHash = MessageDigest.getInstance("SHA-256")
+                .digest(ingestKey.orEmpty().toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it) }
+            return "$keyHash|$bufferRamMb|$bufferFlashMb"
+        }
+
+    /** [settingsFingerprint] of the settings the running gateway was started with. */
+    var appliedSettings: String?
+        get() = prefs.getString(KEY_APPLIED, null)
+        set(value) = prefs.edit().putString(KEY_APPLIED, value).apply()
+
+    /** Whether saved settings differ from those the running gateway uses (it must restart to apply them). */
+    val hasUnappliedSettings: Boolean get() = appliedSettings != settingsFingerprint
+
     private fun encrypt(plain: String): String? = runCatching {
         val cipher = Cipher.getInstance(TRANSFORMATION).apply { init(Cipher.ENCRYPT_MODE, secretKey()) }
         val sealed = cipher.iv + cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
@@ -95,6 +116,7 @@ class IngestKeyStore(context: Context) {
         const val KEY_BUFFER_FLASH_MB = "buffer_flash_mb"
         const val DEFAULT_BUFFER_FLASH_MB = 50
         const val KEY_ENABLED = "gateway_enabled"
+        const val KEY_APPLIED = "applied_settings"
         const val LEGACY_KEY_INGEST = "ingest_key"
         const val LEGACY_SECURE_PREFS = "spotflow_secure_prefs"
     }

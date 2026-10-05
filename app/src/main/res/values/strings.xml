@@ -6,12 +6,38 @@
     <string name="buffer_flash_label">Buffer flash (MB)</string>
     <string name="start">Start</string>
     <string name="stop">Stop</string>
-    <string name="idle">Enter your ingest key and tap Start to relay nearby Spotflow devices.</string>
+    <string name="idle">Tap Start to relay nearby Spotflow devices.</string>
+    <string name="idle_no_key">Set your ingest key in Settings (gear icon, top right), then tap Start.</string>
     <string name="scanning">Scanning for Spotflow devices…</string>
-    <string name="enter_key_first">Enter an ingest key first</string>
+    <string name="enter_key_first">Set your ingest key first</string>
     <string name="permissions_required">Bluetooth and notification permissions are required to run the gateway</string>
     <string name="bluetooth_required">Bluetooth must be on to run the gateway</string>
     <string name="no_bluetooth">This device has no Bluetooth</string>
     <string name="bluetooth_off_banner">⚠  Bluetooth is off — tap to turn it on</string>
     <string name="auth_hint">Tap Stop, re-enter the ingest key, and Start again.</string>
+    <string name="devices_label">Devices</string>
+    <string name="settings">Settings</string>
+    <string name="back">Back</string>
+    <string name="save">Save</string>
+    <string name="cancel">Cancel</string>
+    <string name="section_cloud">Spotflow cloud</string>
+    <string name="section_buffer">Store-and-forward buffer</string>
+    <string name="buffer_section_help">Shared by all devices. When it is full, the device holding the most data loses its oldest messages first.</string>
+    <string name="ingest_key_help">Used to authenticate every device relayed by this gateway. Stored encrypted.</string>
+    <string name="buffer_ram_help">Held in memory while offline. 0 = write to flash right away.</string>
+    <string name="buffer_flash_help">Kept on the phone\'s storage during longer outages. 0 = memory only.</string>
+    <string name="buffer_invalid">Enter a whole number from 0 to %1$d</string>
+    <string name="settings_apply_on_restart">The gateway is running. Saved changes apply once you restart it from the main screen; devices reconnect within seconds.</string>
+    <string name="settings_pending">Settings changed. Restart the gateway to apply them.</string>
+    <string name="restart">Restart</string>
+    <string name="ingest_key_required">Enter the ingest key</string>
+    <string name="settings_saved">Settings saved</string>
+    <string name="discard_title">Discard changes?</string>
+    <string name="discard_message">Your changes to the settings will be lost.</string>
+    <string name="discard">Discard</string>
+    <string name="keep_editing">Keep editing</string>
+    <string name="expanded">Expanded</string>
+    <string name="collapsed">Collapsed</string>
+    <string name="buffer_summary">Buffer   RAM %1$s / %2$s   ·   flash %3$s / %4$s</string>
+    <string name="buffer_summary_ram_only">Buffer   RAM %1$s / %2$s   ·   flash off</string>
 </resources>

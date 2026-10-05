@@ -9,12 +9,16 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
 import android.os.Bundle
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
 import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
+import androidx.core.view.isVisible
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
 import androidx.lifecycle.Lifecycle
@@ -22,22 +26,30 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import io.spotflow.ble.GatewayDeviceState
 import io.spotflow.ble.SpotflowGateway
+import io.spotflow.ble.cloud.BufferUsage
 import io.spotflow.ble.service.SpotflowGatewayService
 import io.spotflow.ble.transport.ConnectionState
 import io.spotflow.gateway.demo.databinding.ActivityMainBinding
+import io.spotflow.gateway.demo.databinding.ItemDeviceBinding
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
- * Minimal reference gateway: enter a Spotflow ingest key, grant BLE + notification permissions, and the
- * app starts a foreground [SpotflowGatewayService] that scans for Spotflow devices and relays their
+ * Minimal reference gateway: set a Spotflow ingest key in [SettingsActivity], grant BLE + notification
+ * permissions, and the app starts a foreground [SpotflowGatewayService] that scans for Spotflow devices and relays their
  * diagnostics to the cloud — continuing while the screen is off.
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private val keyStore by lazy { IngestKeyStore(this) }
+
+    /** One view per device shown, by Bluetooth address — updated in place on every state change. */
+    private val deviceViews = LinkedHashMap<String, ItemDeviceBinding>()
+
+    /** Devices whose details the user collapsed (by address); the rest are shown expanded. */
+    private val collapsed = mutableSetOf<String>()
 
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
         (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
@@ -97,22 +109,21 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.subtitle.text = getString(R.string.subtitle, BuildConfig.VERSION_NAME)
+        savedInstanceState?.getStringArrayList(STATE_COLLAPSED)?.let { collapsed += it }
 
-        // Prefill the previously saved ingest key and buffer sizes.
-        binding.ingestKey.setText(keyStore.ingestKey)
-        binding.bufferRamMb.setText(keyStore.bufferRamMb.toString())
-        binding.bufferFlashMb.setText(keyStore.bufferFlashMb.toString())
+        binding.settingsButton.setOnClickListener { openSettings() }
 
         binding.startButton.setOnClickListener {
-            val key = binding.ingestKey.text?.toString()?.trim().orEmpty()
-            if (key.isEmpty()) {
+            if (keyStore.ingestKey.isNullOrBlank()) {
                 Toast.makeText(this, R.string.enter_key_first, Toast.LENGTH_SHORT).show()
+                openSettings()
             } else {
                 requestPermissionsThenStart()
             }
         }
 
         binding.stopButton.setOnClickListener { stopGateway() }
+        binding.restartButton.setOnClickListener { restartGateway() }
 
         binding.btBanner.setOnClickListener {
             enableBluetoothLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
@@ -129,8 +140,19 @@ class MainActivity : AppCompatActivity() {
         // the window right after Start, before the service has created its gateway.
         val running = isGatewayRunning || resumeGatewayIfEnabled(this, keyStore)
         syncControls(running = running)
-        if (!running) binding.status.text = getString(R.string.idle)
+        if (!running) showIdle()
+        updateSettingsBanner()
     }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putStringArrayList(STATE_COLLAPSED, ArrayList(collapsed))
+    }
+
+    private fun openSettings() = startActivity(Intent(this, SettingsActivity::class.java))
+
+    private fun idleText(): String =
+        getString(if (keyStore.ingestKey.isNullOrBlank()) R.string.idle_no_key else R.string.idle)
 
     override fun onStart() {
         super.onStart()
@@ -178,24 +200,30 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startGateway() {
-        val key = binding.ingestKey.text?.toString()?.trim().orEmpty()
-        // 0 is allowed for either tier: RAM 0 = spill to flash immediately (minimal crash-loss risk);
-        // flash 0 = RAM-only, no persistence.
-        val ramMb = binding.bufferRamMb.text?.toString()?.toIntOrNull()?.coerceAtLeast(0)
-            ?: keyStore.bufferRamMb
-        val flashMb = binding.bufferFlashMb.text?.toString()?.toIntOrNull()?.coerceAtLeast(0)
-            ?: keyStore.bufferFlashMb
-        keyStore.ingestKey = key // persist across restarts
-        keyStore.bufferRamMb = ramMb
-        keyStore.bufferFlashMb = flashMb
+        if (!configureGatewayService(keyStore)) { // e.g. the stored key could not be decrypted
+            Toast.makeText(this, R.string.enter_key_first, Toast.LENGTH_SHORT).show()
+            return
+        }
         keyStore.gatewayEnabled = true // GatewayApp restores the service hooks after a process restart
-
-        configureGatewayService(key, ramMb, flashMb)
         SpotflowGatewayService.start(this)
 
         syncControls(running = true)
         binding.errorBanner.visibility = View.GONE
-        binding.status.text = getString(R.string.scanning)
+        render(emptyList())
+    }
+
+    /**
+     * Applies saved settings by restarting the gateway in place: the service stays in the foreground and
+     * devices reconnect within seconds, so relaying pauses far shorter than with Stop and Start.
+     */
+    private fun restartGateway() {
+        if (!configureGatewayService(keyStore)) {
+            Toast.makeText(this, R.string.enter_key_first, Toast.LENGTH_SHORT).show()
+            return
+        }
+        SpotflowGatewayService.restart(this)
+        binding.errorBanner.visibility = View.GONE
+        binding.settingsBanner.isVisible = false
     }
 
     private fun stopGateway() {
@@ -204,16 +232,48 @@ class MainActivity : AppCompatActivity() {
         syncControls(running = false)
         binding.errorBanner.visibility = View.GONE
         binding.btBanner.visibility = View.GONE
-        binding.status.text = getString(R.string.idle)
+        binding.settingsBanner.isVisible = false
+        showIdle()
     }
 
-    /** Enables Start/Stop and the settings fields to match whether the gateway is running. */
+    /** Shows the restart prompt while the running gateway uses older settings than those saved. */
+    private fun updateSettingsBanner() {
+        binding.settingsBanner.isVisible = isGatewayRunning && keyStore.hasUnappliedSettings
+    }
+
+    private fun showIdle() {
+        render(emptyList())
+        binding.status.text = idleText()
+        binding.bufferSummary.isVisible = false
+    }
+
+    /** The gateway-wide buffer line; amber once either tier is over 80% full (eviction is near). */
+    private fun renderUsage(usage: BufferUsage) {
+        if (!isGatewayRunning) return
+        val ram = humanBytes(usage.ramBytes)
+        val ramMax = limitText(usage.ramMaxBytes)
+        binding.bufferSummary.text = if (usage.flashMaxBytes > 0) {
+            getString(R.string.buffer_summary, ram, ramMax, humanBytes(usage.flashBytes), limitText(usage.flashMaxBytes))
+        } else {
+            getString(R.string.buffer_summary_ram_only, ram, ramMax)
+        }
+        val nearlyFull = usage.ramBytes > usage.ramMaxBytes * 0.8 ||
+            (usage.flashMaxBytes > 0 && usage.flashBytes > usage.flashMaxBytes * 0.8)
+        binding.bufferSummary.setTextColor(
+            if (nearlyFull) {
+                ContextCompat.getColor(this, R.color.status_pending)
+            } else {
+                binding.subtitle.currentTextColor
+            },
+        )
+        binding.bufferSummary.alpha = if (nearlyFull) 1f else 0.7f
+        binding.bufferSummary.isVisible = true
+    }
+
+    /** Enables Start/Stop to match whether the gateway is running. */
     private fun syncControls(running: Boolean) {
         binding.startButton.isEnabled = !running
         binding.stopButton.isEnabled = running
-        binding.ingestKeyLayout.isEnabled = !running
-        binding.bufferRamMb.isEnabled = !running
-        binding.bufferFlashMb.isEnabled = !running
     }
 
     private fun observeDevices() {
@@ -227,9 +287,13 @@ class MainActivity : AppCompatActivity() {
                     val gateway = SpotflowGatewayService.gateway
                     if (gateway !== current) {
                         current = gateway
+                        updateSettingsBanner() // a new gateway was built from the saved settings
                         collectJob?.cancel()
                         collectJob = gateway?.let { g ->
-                            launch { g.devices.collect { render(it.values.toList()) } }
+                            launch {
+                                launch { g.devices.collect { render(it.values.toList()) } }
+                                launch { g.bufferUsage.collect { renderUsage(it) } }
+                            }
                         }
                     }
                     delay(300)
@@ -239,10 +303,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun render(devices: List<GatewayDeviceState>) {
-        if (devices.isEmpty()) {
-            binding.status.text = getString(R.string.scanning)
-        } else {
-            binding.status.text = devices.joinToString("\n\n") { formatDevice(it) }
+        binding.status.isVisible = devices.isEmpty()
+        binding.status.text = getString(R.string.scanning)
+
+        // Update the device views in place (so a collapsed device stays collapsed), in the gateway's order.
+        val shown = devices.map { it.address }.toSet()
+        deviceViews.keys.filter { it !in shown }.forEach { address ->
+            binding.deviceList.removeView(deviceViews.remove(address)!!.root)
+        }
+        devices.forEachIndexed { index, device ->
+            val item = deviceViews.getOrPut(device.address) { createDeviceView(device.address) }
+            if (binding.deviceList.getChildAt(index) !== item.root) {
+                binding.deviceList.removeView(item.root)
+                binding.deviceList.addView(item.root, index)
+            }
+            item.name.text = deviceTitle(device)
+            item.details.text = formatDetails(device)
+            showExpanded(item, device.address !in collapsed, animate = false)
         }
 
         val error = devices.firstNotNullOfOrNull { it.error }
@@ -259,27 +336,61 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun formatDevice(d: GatewayDeviceState): String {
-        val cloud = if (d.cloudConnected) "connected" else "offline"
-        val marker = when {
-            d.error != null -> "✗"
-            d.cloudConnected && d.ble == ConnectionState.READY -> "●"
-            else -> "…"
+    private fun createDeviceView(address: String): ItemDeviceBinding =
+        ItemDeviceBinding.inflate(layoutInflater, binding.deviceList, false).also { item ->
+            item.header.setOnClickListener {
+                val expand = address in collapsed
+                if (expand) collapsed -= address else collapsed += address
+                showExpanded(item, expand, animate = true)
+            }
         }
+
+    /** Shows or hides a device's details; the chevron points down when expanded, sideways when not. */
+    private fun showExpanded(item: ItemDeviceBinding, expanded: Boolean, animate: Boolean) {
+        item.details.isVisible = expanded
+        val rotation = if (expanded) 0f else if (item.root.layoutDirection == View.LAYOUT_DIRECTION_RTL) 90f else -90f
+        if (animate) item.chevron.animate().rotation(rotation).setDuration(150).start() else item.chevron.rotation = rotation
+        ViewCompat.setStateDescription(
+            item.header,
+            getString(if (expanded) R.string.expanded else R.string.collapsed),
+        )
+    }
+
+    /**
+     * The device name led by a status marker: green ● when relaying (BLE ready and MQTT connected),
+     * amber … while connecting or offline, red ✗ on an error. Glyphs differ too, not just colors.
+     */
+    private fun deviceTitle(d: GatewayDeviceState): CharSequence {
+        val (marker, color) = when {
+            d.error != null -> "✗" to R.color.status_error
+            d.cloudConnected && d.ble == ConnectionState.READY -> "●" to R.color.status_ok
+            else -> "…" to R.color.status_pending
+        }
+        return SpannableString("$marker ${d.deviceId ?: d.address}").apply {
+            setSpan(
+                ForegroundColorSpan(ContextCompat.getColor(this@MainActivity, color)),
+                0,
+                marker.length,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+    }
+
+    private fun formatDetails(d: GatewayDeviceState): String {
+        val cloud = if (d.cloudConnected) "connected" else "offline"
         fun line(label: String, value: String) = "    ${"$label:".padEnd(17)}$value"
         // Only show a live signal reading while actually connected — otherwise it would keep
         // displaying the last RSSI next to "DISCONNECTED", which reads as contradictory.
         val signal = d.rssi?.takeIf { d.ble == ConnectionState.READY }
             ?.let { "$it dBm · ${signalQuality(it)}" } ?: "—"
         return buildString {
-            appendLine("$marker ${d.deviceId ?: d.address}")
             appendLine(line("BLE device", d.ble.toString()))
             appendLine(line("Signal", signal))
             appendLine(line("MQTT connection", cloud))
             appendLine(line("Forwarded", "${d.forwarded} msgs"))
             appendLine(line("Received", "${d.received} msgs"))
-            appendLine(line("Buffer RAM", humanBytes(d.ramBytes)))
-            append(line("Buffer flash", humanBytes(d.diskBytes)))
+            // Messages not yet uploaded; where they sit (RAM or flash) is shown for the whole gateway above.
+            append(line("Waiting", "${d.pendingMessages} msgs · ${humanBytes(d.ramBytes + d.diskBytes)}"))
         }
     }
 
@@ -290,9 +401,17 @@ class MainActivity : AppCompatActivity() {
         else -> "very weak"
     }
 
+    /** A configured limit: whole megabytes as set in Settings (e.g. "50 MB"). */
+    private fun limitText(bytes: Long): String =
+        if (bytes % (1024 * 1024) == 0L) "${bytes / (1024 * 1024)} MB" else humanBytes(bytes)
+
     private fun humanBytes(bytes: Long): String = when {
         bytes >= 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
         bytes >= 1024 -> "%.1f KB".format(bytes / 1024.0)
         else -> "$bytes B"
+    }
+
+    private companion object {
+        const val STATE_COLLAPSED = "collapsed_devices"
     }
 }
