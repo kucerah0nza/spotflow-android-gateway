@@ -20,6 +20,15 @@ Spotflow.
 | `spotflow-ble-gateway` | The reusable library (`io.spotflow.ble`), published as an AAR. |
 | `app` | A reference gateway app that uses the library. |
 
+### Demo app
+
+Enter an ingest key, optionally size the buffer (RAM and flash, in MB), and tap **Start**. The app runs
+the gateway in the foreground service and lists every device it relays with its BLE and MQTT state,
+signal strength, buffered bytes, **Forwarded** (messages delivered to the cloud) and **Received**
+(desired configuration received from the cloud, e.g. a log-severity change made in the portal). The
+header shows the app version. The ingest key is stored encrypted with the Android Keystore, and a
+gateway left running resumes by itself after the app is updated or the phone reboots.
+
 ## How it works
 
 ```mermaid
@@ -81,6 +90,11 @@ devices never come back.
   the topic by prefix. It is written only after the device has sent its reported configuration in the
   current session: the Device SDK discards desired configuration that arrives earlier. Until then it
   stays queued and unacknowledged, so nothing is lost while the device is away.
+- **Desired configuration after a device reboot** — the broker sends desired configuration only when an
+  MQTT connection is established (a device on MQTT directly gets it again on every reboot). Because the
+  gateway keeps a device's MQTT connection across BLE reconnects, it remembers the last configuration
+  written to the device and writes it again at the start of each session, unless newer configuration is
+  pending — so a rebooted device, which starts from its compiled defaults, is brought back in sync.
 - **Delivery** is at-least-once: a publish that timed out or was cut off by a disconnect may arrive twice.
 - **Reassembly** only delivers a message whose size matches the length declared in its first fragment;
   a message with a lost fragment is dropped rather than forwarded truncated.
@@ -227,7 +241,10 @@ Requires **JDK 17** and the **Android SDK** (`compileSdk 35`, `minSdk 26`). Poin
 ./gradlew :app:assembleDebug                        # build the demo app
 ```
 
-CI (`.github/workflows/ci.yml`) runs the library unit tests on every push and pull request.
+CI (`.github/workflows/ci.yml`) runs the library unit tests and lint and builds the demo APK on every
+push to `main` and every pull request. Pushing a `v*` tag runs `.github/workflows/release.yml`, which tests,
+builds the signed release APK and the AAR, and publishes them as a GitHub Release. Bump `versionCode` /
+`versionName` in `app/build.gradle.kts` before tagging, so the APK installs as an update.
 
 ### Signing
 
@@ -244,12 +261,16 @@ workflow refuses to publish.
    multi-fragment messages, and malformed or incomplete input; `PersistentMessageQueueTest` and
    `StoreAndForwardBufferTest` cover the two-tier buffer (FIFO across tiers, eviction, schema upgrade,
    RAM-only mode); `GatewaySessionTest` covers the orchestration against fake BLE/MQTT (offline buffering,
-   uploading after disconnect, link hand-over, device filter, poison messages, desired configuration,
-   recovering buffers from an earlier run).
-2. **On device:** flash the Device SDK BLE sample onto a supported board (e.g. ESP32-C3/C6, Silicon Labs
-   EFR32), install the demo app, enter an ingest key and tap **Start**. Verify diagnostics arrive in the
-   Spotflow cloud, then exercise the resilience paths:
+   uploading after disconnect, link hand-over, device filter, poison messages, desired configuration
+   incl. its re-send after a device reboot, recovering buffers from an earlier run); `MqttUplinkTest`
+   covers desired-configuration topic matching.
+2. **On device:** flash the Device SDK BLE sample onto a supported board (e.g. TI CC2340, ESP32-C3/C6,
+   Silicon Labs EFR32), install the demo app, enter an ingest key and tap **Start**. Verify diagnostics
+   arrive in the Spotflow cloud, then exercise the resilience paths:
    - turn the **screen off** — relaying continues;
    - **restart the device** — the gateway reconnects and resumes;
    - toggle **airplane mode** — the buffer grows offline and drains when back online;
-   - force a **core dump** — the full dump is delivered.
+   - force a **core dump** — the full dump is delivered;
+   - change the **minimal log severity in the portal** — with the device connected and while it is off;
+     the portal leaves "Synchronizing" once the device applies it, and **Received** counts it;
+   - **restart the device** after changing the severity — the configured severity is restored.
