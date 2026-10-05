@@ -59,6 +59,14 @@ internal class CloudLink(
     private val pendingDesired = ArrayDeque<PendingDesired>()
     private val desiredSignal = Channel<Unit>(Channel.CONFLATED)
 
+    /**
+     * The last desired configuration written to the device. The broker sends the current desired
+     * configuration only when an MQTT connection is established — a device on MQTT directly gets it again
+     * after every reboot, since it reconnects. This link outlives BLE sessions, so a rebooted device
+     * (which starts from its compiled defaults) would otherwise never get it back. Guarded by [desiredLock].
+     */
+    private var lastWrittenDesired: ByteArray? = null
+
     init {
         uplink.desiredConfigurationHandler = { payload, ack ->
             val queued = synchronized(desiredLock) {
@@ -168,8 +176,22 @@ internal class CloudLink(
      * Writes pending desired configuration to the device via [write], in arrival order, acknowledging
      * each to the broker only once written. Runs until cancelled; whatever was not written stays pending
      * for the next BLE session.
+     *
+     * A session starts by replaying the last configuration written to the device (unless newer ones are
+     * pending), since the device may have rebooted and lost it — see [lastWrittenDesired].
      */
     suspend fun deliverDesiredConfiguration(write: suspend (ByteArray) -> Unit) {
+        val replay = synchronized(desiredLock) { lastWrittenDesired.takeIf { pendingDesired.isEmpty() } }
+        if (replay != null) {
+            try {
+                write(replay)
+                Log.i(TAG, "desired configuration re-sent to $deviceId (${replay.size} bytes)")
+            } catch (c: CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                Log.w(TAG, "desired configuration re-send failed: ${t.message}")
+            }
+        }
         while (true) {
             val head = synchronized(desiredLock) { pendingDesired.firstOrNull() }
             if (head == null) {
@@ -178,6 +200,7 @@ internal class CloudLink(
             }
             val done = try {
                 write(head.payload)
+                synchronized(desiredLock) { lastWrittenDesired = head.payload }
                 Log.i(TAG, "desired configuration written to $deviceId (${head.payload.size} bytes)")
                 true
             } catch (c: CancellationException) {

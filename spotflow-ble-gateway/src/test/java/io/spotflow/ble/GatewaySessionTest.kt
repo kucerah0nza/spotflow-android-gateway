@@ -358,6 +358,50 @@ class GatewaySessionTest {
     }
 
     @Test
+    fun `a rebooted device gets the last desired configuration again over the reused cloud link`() = runTest {
+        val uplink = FakeUplink()
+        val links = registry(backgroundScope, uplink)
+        val first = FakeBleConnection()
+        val job1 = launch { runCatching { session(first, uplink, links).run() } }
+        runCurrent()
+        uplink.deliverDesired(byteArrayOf(6)) {}
+        runCurrent()
+        first.drop(); runCurrent()
+
+        // The broker sends desired configuration only on (re)connect; the link stays connected meanwhile.
+        val second = FakeBleConnection().apply { reportsConfiguration = false }
+        val job2 = launch { runCatching { session(second, uplink, links).run() } }
+        runCurrent()
+        assertTrue("held until the rebooted device reports", second.sentDesiredConfig.isEmpty())
+
+        second.reportConfiguration()
+        runCurrent()
+        assertEquals(listOf(6), second.sentDesiredConfig.map { it[0].toInt() })
+        assertEquals("MQTT connection is reused", 1, uplink.connectCount)
+        second.drop(); runCurrent(); job1.cancel(); job2.cancel()
+    }
+
+    @Test
+    fun `newer pending desired configuration replaces the replay`() = runTest {
+        val uplink = FakeUplink()
+        val links = registry(backgroundScope, uplink)
+        val first = FakeBleConnection()
+        val job1 = launch { runCatching { session(first, uplink, links).run() } }
+        runCurrent()
+        uplink.deliverDesired(byteArrayOf(6)) {}
+        runCurrent()
+        first.drop(); runCurrent()
+        uplink.deliverDesired(byteArrayOf(7)) {} // changed in the portal while the device was away
+        runCurrent()
+
+        val second = FakeBleConnection()
+        val job2 = launch { runCatching { session(second, uplink, links).run() } }
+        runCurrent()
+        assertEquals(listOf(7), second.sentDesiredConfig.map { it[0].toInt() })
+        second.drop(); runCurrent(); job1.cancel(); job2.cancel()
+    }
+
+    @Test
     fun `failed desired configuration write is not acknowledged and is retried`() = runTest {
         val ble = FakeBleConnection().apply { failDesiredWrites = 1 }
         val uplink = FakeUplink()
