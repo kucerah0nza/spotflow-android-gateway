@@ -48,11 +48,19 @@ flowchart LR
 
     subgraph G["Android gateway (library)"]
         direction TB
-        S["SpotflowGattSession<br/>serialized GATT queue"]
-        F["FrameCodec<br/>reassemble fragments"]
-        B[("StoreAndForwardBuffer<br/>RAM tier → flash tier<br/>(byte-bounded, FIFO)")]
-        U["MqttUplink"]
-        S --> F --> B --> U
+        subgraph BLE["BLE session · ends when the link drops"]
+            direction TB
+            S["SpotflowGattSession<br/>serialized GATT queue"]
+            F["FrameCodec<br/>reassemble fragments"]
+            S --> F
+        end
+        subgraph CL["CloudLink · one per device ID, outlives BLE sessions"]
+            direction TB
+            B[("StoreAndForwardBuffer<br/>RAM tier → flash tier<br/>(byte-bounded, FIFO)")]
+            U["MqttUplink<br/>up to 16 publishes in flight"]
+            B --> U
+        end
+        F --> B
     end
 
     C["mqtt.spotflow.io:8883"]
@@ -60,12 +68,14 @@ flowchart LR
     D -- "GATT notify · framed CBOR<br/>(TX Stream 0005)" --> S
     U -- "MQTTS · QoS 1<br/>user = device ID · pass = ingest key" --> C
     C -- "desired config<br/>(config-cbor-c2d)" --> U
-    U -- "RX Stream 0006<br/>write no-response" --> D
+    U -- "desired config, held until<br/>a session can write it" --> S
+    S -- "RX Stream 0006<br/>write no-response" --> D
 ```
 
-Received BLE messages are reassembled and **buffered RAM-first** (spilling to a flash tier only during
-longer outages), then a drainer publishes them to MQTT when the network is available — so data survives
-outages, the flash isn't worn in steady state, and BLE ingestion never blocks on the network.
+Received BLE messages are reassembled and **buffered RAM-first** (spilling to a flash tier only once the
+RAM tier is full, i.e. during longer outages), then a drainer publishes them to MQTT when the network is
+available — so data survives outages, the flash isn't worn in steady state, and BLE ingestion never
+blocks on the network.
 
 The cloud side of each device (its buffer, MQTT connection and drainer — `CloudLink`) is independent of
 the BLE connection: when a device disconnects, its link keeps uploading whatever is still buffered and
@@ -287,11 +297,20 @@ gateway.bufferUsage  // StateFlow<BufferUsage>: RAM and flash use against the li
 
 ```mermaid
 flowchart TD
-    A["BLE message received"] --> B["reassemble → enqueue to RAM tier"]
-    B --> C{"network<br/>available?"}
-    C -- "yes" --> D["publish to MQTT (QoS 1) · remove from buffer"]
-    C -- "no" --> E["keep buffering in RAM;<br/>spill oldest to flash when RAM fills<br/>(evict oldest when flash is full)"]
-    E --> C
+    A["BLE message received"] --> B["reassemble → append to the device's queue in RAM"]
+    B --> R{"RAM budget<br/>exceeded?"}
+    R -- "yes" --> S["spill the oldest to flash, one batch<br/>(flash full too: the device holding<br/>the most loses its oldest)"]
+    Q(["queued, oldest first:<br/>flash, then RAM"])
+    R -- "no" --> Q
+    S --> Q
+    Q --> C{"network up and<br/>MQTT connected?"}
+    C -- "no" --> W["wait for the network,<br/>reconnect with backoff"]
+    W --> C
+    C -- "yes" --> P["publish up to 16 at once (QoS 1)"]
+    P --> K{"acknowledged<br/>by the broker?"}
+    K -- "yes" --> X["remove from the buffer"]
+    K -- "no" --> F["keep it and retry, one at a time<br/>(dropped only if the broker keeps<br/>refusing that very message)"]
+    F --> C
 ```
 
 - **Reconnect** — a dropped BLE link is reconnected automatically: right after a working session drops,
@@ -399,14 +418,17 @@ Requires **JDK 17** and the **Android SDK** (the library compiles against API 35
 
 ```bash
 ./gradlew :spotflow-ble-gateway:testDebugUnitTest   # run the library unit tests (no device needed)
+./gradlew :app:testDebugUnitTest                    # run the demo's screen tests (no device needed)
 ./gradlew :spotflow-ble-gateway:assembleRelease     # build the AAR
 ./gradlew :app:assembleDebug                        # build the demo app
 ./gradlew :spotflow-ble-gateway:apiDump             # after changing the public API on purpose; commit the result
 ```
 
-CI (`.github/workflows/ci.yml`) runs the library unit tests, the public-API check and lint, builds the
-release AAR and the demo shrunk by R8 (which checks the library's ProGuard rules), and builds the demo APK
-— on every push to `main` and every pull request.
+CI (`.github/workflows/ci.yml`) runs the library's and the demo's unit tests, the public-API check and
+lint, builds the release AAR and the demo shrunk by R8 (which checks the library's ProGuard rules), and
+builds the demo APK — on every push to `main` and every pull request. Dependabot proposes dependency
+updates; a few are held back on purpose, each with its reason in `.github/dependabot.yml` and
+`gradle/libs.versions.toml`.
 
 **Releasing:** set `spotflowVersion` in `gradle.properties` (the one version of the library and the demo;
 the demo's version code is derived from it), commit, and tag that commit `v<version>`. The tag runs
@@ -443,7 +465,11 @@ publish.
      data handed over across a restart.
    - `SpotflowGattSessionTest`, `GattAttachmentTest` — the GATT engine and attach mode against a simulated
      peripheral: which callback completes which operation, timeouts, attaching to a GATT that is still
-     connecting, detaching.
+     connecting, detaching. They run on Android 8 and Android 15, covering both ways Android passes GATT
+     values (through the characteristic before Android 13, as arguments since).
+   - `NetworkMonitorTest` — following the phone's connectivity.
+   - `DemoScreensTest` (in `app`) — the demo's screens come up and show what a real gateway, hosted by the
+     real service, reports.
 2. **On device:** flash the Device SDK BLE sample onto a supported board (e.g. TI CC2340, ESP32-C3/C6,
    Silicon Labs EFR32), install the demo app, enter an ingest key and tap **Start**. Verify diagnostics
    arrive in the Spotflow cloud, then exercise the resilience paths:
