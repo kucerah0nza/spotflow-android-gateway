@@ -1,7 +1,7 @@
 [versions]
 agp = "8.13.2"
 # The newest Kotlin whose metadata this AGP's R8 reads without warnings; move it together with AGP.
-kotlin = "2.3.21"
+kotlin = "2.4.21"
 coroutines = "1.11.0"
 # Held back on purpose: the library depends on it, and from 1.17 on it forces every app that uses the
 # library to compile against API 36 or newer. Raise it together with the library's compileSdk.
