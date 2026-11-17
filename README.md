@@ -11,7 +11,8 @@ smart thermostat): add the library, hand it a connection or let it scan, and the
 Spotflow.
 
 > **Download:** each [GitHub Release](../../releases) (published automatically on every `v*` tag) attaches
-> the demo **APK** (sideload to try the gateway) and the library **`.aar`** (drop into an integrating app).
+> the demo **APK** (sideload to try the gateway) and the library, as a **Maven repository zip** (the way
+> to add it to an app, see [Adding the library](#adding-the-library)) and as a bare `.aar`.
 
 ## Modules
 
@@ -25,14 +26,19 @@ Spotflow.
 Open **Settings** (gear icon, top right), enter an ingest key, optionally size the buffer (RAM and flash,
 in MB, shared by all devices), and tap **Save**; then tap **Start**. Settings can be changed while the
 gateway runs: it keeps relaying with the old ones, and the main screen offers a **Restart** that applies
-them within seconds (instead of a Stop/edit/Start round that leaves devices waiting). The app runs the gateway in the foreground service and the main screen
-lists every device it relays — tap a name to collapse or expand its details — with a status marker (green
-when relaying), its BLE and MQTT state, signal strength, messages waiting to upload, **Forwarded**
-(messages delivered to the cloud) and **Received** (desired configuration received from the cloud, e.g. a
-log-severity change made in the portal). The
-header shows the app version, and a line under **Devices** shows the gateway-wide buffer use against the
-limits in Settings (amber above 80%). The ingest key is stored encrypted with the Android Keystore, and a
-gateway left running resumes by itself after the app is updated or the phone reboots.
+them within seconds (instead of a Stop/edit/Start round that leaves devices waiting). The app runs the
+gateway in the foreground service and the main screen lists every device it relays — tap a name to
+collapse or expand its details — with a status marker (green when relaying), its BLE and MQTT state,
+signal strength, messages waiting to upload, **Forwarded** (messages delivered to the cloud) and
+**Received** (desired configuration received from the cloud, e.g. a log-severity change made in the
+portal). While no device is listed it says what discovery is doing (scanning, waiting for Bluetooth,
+retrying a failed scan). The header shows the app version, and a line under **Devices** shows the
+gateway-wide buffer use against the limits in Settings (amber above 80%; it says so when there is no
+network). The ingest key is stored encrypted with the Android Keystore, and a gateway left running
+resumes by itself after the app is updated or the phone reboots.
+
+The demo relays every Spotflow device in range. An app for real devices passes a `DeviceFilter` that
+accepts only its own — see the security note under [Managed mode](#managed-mode-library-owns-the-connection).
 
 ## How it works
 
@@ -100,22 +106,84 @@ devices never come back.
   gateway keeps a device's MQTT connection across BLE reconnects, it remembers the last configuration
   written to the device and writes it again at the start of each session, unless newer configuration is
   pending — so a rebooted device, which starts from its compiled defaults, is brought back in sync.
-- **Delivery** is at-least-once: a publish that timed out or was cut off by a disconnect may arrive twice.
+- **Upload** — up to 16 messages are in flight at once, sent in order, so throughput is not bound to one
+  network round trip per message.
+- **Delivery** is at-least-once: when a connection is lost, the messages still waiting for their
+  acknowledgement may or may not have reached the broker, and are sent again — so they can arrive twice.
 - **Reassembly** only delivers a message whose size matches the length declared in its first fragment;
   a message with a lost fragment is dropped rather than forwarded truncated.
 
 ### Package layout (`spotflow-ble-gateway/src/main/java/io/spotflow/ble`)
 
-- `protocol/` — `GattProfile` (UUIDs), `MessageType`, `Message`, `FrameCodec` (pure JVM, unit-tested).
+The library is built in Kotlin's explicit-API mode: what is public is public on purpose, and
+`spotflow-ble-gateway/api/spotflow-ble-gateway.api` records it (CI fails if the two disagree). Everything
+else is internal.
+
+- **Public** — `SpotflowGateway`, `GattAttachment`, `DeviceFilter`, `GatewayDeviceState` / `DeviceError`,
+  `GatewayStatus` / `ScanState`, `SpotflowLog`; `cloud/` `MqttConfig` / `SpotflowTopics` / `PublishQos`,
+  `CredentialsProvider` + `StaticIngestKey`, `BufferUsage`; `transport/ConnectionState`;
+  `protocol/GattProfile` (the UUIDs); `service/SpotflowGatewayService`.
+- `protocol/` — `MessageType`, `Message`, `FrameCodec` (pure JVM, unit-tested).
 - `transport/` — `BleConnection` (with `ManagedBleConnection` / `AttachedBleConnection`),
   `SpotflowGattSession` (serialized GATT command queue + callback bridge), `SpotflowScanner`.
-- `cloud/` — `MqttUplink`, `MqttConfig` / `SpotflowTopics`, `CredentialsProvider` + `StaticIngestKey`,
-  `StoreAndForwardBuffer` (a device's two-tier RAM+flash queue) within `BufferPool` (the gateway-wide
-  RAM and flash budget), backed by `MessageStore` (the shared SQLite flash tier),
-  `MqttAuthException` / `MqttConnectException`.
-- `SpotflowGateway`, `GatewaySession` (BLE side), `CloudLink` / `CloudLinkRegistry` (per-device cloud
-  side that outlives BLE sessions), `DeviceFilter` — orchestration.
-- `service/SpotflowGatewayService` — foreground service (`connectedDevice`).
+- `cloud/` — `MqttUplink` (behind the `Uplink` interface), `StoreAndForwardBuffer` (a device's two-tier
+  RAM+flash queue) within `BufferPool` (the gateway-wide RAM and flash budget), backed by `MessageStore`
+  (the shared SQLite flash tier).
+- `GatewaySession` (BLE side), `CloudLink` / `CloudLinkRegistry` (per-device cloud side that outlives BLE
+  sessions) — orchestration. `GatewayPlatform` is the seam between that logic and Android (adapter,
+  scanner, GATT, connectivity, MQTT client), which is what lets the reconnect logic be unit-tested.
+
+## Adding the library
+
+The library is not on Maven Central yet. Each release attaches
+`spotflow-ble-gateway-<tag>-maven.zip`: a Maven repository holding the AAR **and its POM**, so Gradle
+resolves the library's own dependencies (the MQTT client, coroutines, AndroidX core). Unzip it into your
+project — say `spotflow-maven/` — and point Gradle at it:
+
+```kotlin
+// settings.gradle.kts
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url = uri("$rootDir/spotflow-maven") }
+    }
+}
+
+// app/build.gradle.kts
+dependencies {
+    implementation("io.spotflow:spotflow-ble-gateway:<version>")
+}
+```
+
+If you take the bare `.aar` instead (`implementation(files("libs/….aar"))`), it comes with no dependency
+information; add what it needs yourself, or the app crashes with `NoClassDefFoundError` at runtime:
+
+```kotlin
+implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
+implementation("androidx.core:core-ktx:1.16.0")
+implementation("com.hivemq:hivemq-mqtt-client:1.4.2")
+```
+
+Either way, the MQTT client pulls in several Netty jars that ship colliding `META-INF` entries, which
+fails the build ("2 files found with path…") until they are excluded:
+
+```kotlin
+android {
+    packaging {
+        resources {
+            excludes += setOf(
+                "META-INF/INDEX.LIST", "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE", "META-INF/LICENSE.txt", "META-INF/NOTICE", "META-INF/NOTICE.txt",
+            )
+            pickFirsts += setOf("META-INF/io.netty.versions.properties", "META-INF/native-image/**")
+        }
+    }
+}
+```
+
+R8 / ProGuard rules come with the library (CI builds the demo shrunk by R8 to check them). Coming from
+0.1.x? See the migration notes in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start
 
@@ -130,42 +198,66 @@ val gateway = SpotflowGateway(
 gateway.startScanning() // scans for the Spotflow service, connects, relays, reconnects
 ```
 
-> **Security — set a `deviceFilter`.** Managed mode connects to anything that advertises the Spotflow
-> service, and the BLE protocol does not authenticate devices. Without a filter, any nearby peripheral
-> could publish data under any device ID in your workspace (using your ingest key) and receive that
-> device's desired configuration. The gateway also refuses a second live session for a device ID that is
-> already connected, and never relays a device with an empty ID.
+> **Security — the `deviceFilter` is required for a reason.** Managed mode connects to anything that
+> advertises the Spotflow service, and the BLE protocol does not authenticate devices. A filter that
+> accepts everything (`DeviceFilter.AcceptAll`, fine for a demo or a lab) lets any nearby peripheral
+> publish data under any device ID in your workspace, using your ingest key, and receive that device's
+> desired configuration. The gateway also refuses a second live session for a device ID that is already
+> connected, and never relays a device with an empty ID.
+
+A device the filter rejects is disconnected and left alone; it is asked about again after ten minutes,
+or right away after `gateway.retryStopped()` — call that when what the filter accepts has changed (the
+user signed in, a device was provisioned). `gateway.detach(address)` takes a device out for good: the
+scan leaves it alone until `retryStopped()`.
 
 ### Attach mode (host already owns the connection)
 
-For apps that already hold a `BluetoothGatt` to the same device and don't want a second connection.
+For apps that already hold a `BluetoothGatt` to the same device and don't want a second connection. It
+takes two steps, so that the gateway never issues a GATT operation before its callbacks can reach it:
 
 ```kotlin
-val connection = gateway.attach(existingGatt)
+val attachment = gateway.newAttachment()
+
+// 1. Wire its callback. Either pass it to connectGatt…
+val gatt = device.connectGatt(context, false, attachment.gattCallback, BluetoothDevice.TRANSPORT_LE)
+// …or, if you have a callback of your own, forward every event it receives to attachment.gattCallback.
+
+// 2. Start relaying. The GATT may still be connecting; the gateway waits for the link.
+attachment.start(gatt)
 ```
 
 **Host contract for attach mode:**
-1. Forward your `BluetoothGattCallback` events to `connection.gattCallback` (use it directly as your
-   `connectGatt` callback, or fan out to it from your own callback).
-2. Run your own GATT operations inside `connection.runExclusive { gatt -> ... }` while attached — the
+1. `attachment.gattCallback` must receive **every** event of the GATT — if you fan out from your own
+   callback, forward all of them, including both the API 33+ and the older overloads of
+   `onCharacteristicRead` and `onCharacteristicChanged`.
+2. Run your own GATT operations inside `attachment.runExclusive { gatt -> ... }` while attached — the
    Android BLE stack allows only one outstanding GATT operation at a time, and this serializes yours with
-   the gateway's. The gateway doesn't poll RSSI on an attached connection unless you pass
-   `attach(gatt, pollRssi = true)`.
-3. The host owns connect/disconnect and reconnection; `close()` only detaches.
+   the gateway's. (As a second line of defence the gateway ignores results for characteristics it did not
+   ask about.) The gateway doesn't poll RSSI on an attached connection unless you ask for it with
+   `newAttachment(pollRssi = true)`.
+3. The host owns connect/disconnect and reconnection. A relaying session ends when the link drops; call
+   `attachment.start(gatt)` again when it is back — the callback stays valid, so a GATT reconnected with
+   `gatt.connect()` needs no rewiring.
+4. `attachment.detach()` stops relaying and tells the device to stop streaming; the link stays up.
+5. An attachment relays one device at a time; create one per device to relay several.
 
 ### Background operation (screen off)
 
 Run the gateway from the bundled foreground service:
 
 ```kotlin
-SpotflowGatewayService.gatewayFactory = { ctx -> SpotflowGateway(ctx, StaticIngestKey(key)) }
+SpotflowGatewayService.gatewayFactory = { ctx -> SpotflowGateway(ctx, StaticIngestKey(key), deviceFilter) }
 SpotflowGatewayService.onReady = { it.startScanning() }
 SpotflowGatewayService.start(context)
 ```
 
 To apply new settings, update the hooks and call `SpotflowGatewayService.restart(context)`: it replaces
 the gateway in place while the service stays in the foreground, so relaying pauses only while devices
-reconnect (data the old gateway held is flushed to flash and delivered by the new one).
+reconnect. Data the old gateway held is written to flash and delivered by the new one — also for devices
+that don't reconnect.
+
+`SpotflowGatewayService.gatewayFlow` is a `StateFlow` of the gateway the service hosts (null while it
+isn't running); collect it to follow the gateway across restarts.
 
 It runs as foreground service type `connectedDevice` with a persistent (customizable) notification. For a
 dedicated always-on gateway, also guide users to disable battery optimization (Doze) for the app.
@@ -174,6 +266,22 @@ The service is `START_STICKY`, so Android recreates it after killing the process
 the static `gatewayFactory` / `onReady` hooks are unset. **Set them from `Application.onCreate()`**
 whenever the gateway should be running (the demo's `GatewayApp` does this from a persisted flag);
 otherwise the restarted service stops itself and relaying ends until the app is opened again.
+
+### Observing the gateway
+
+```kotlin
+gateway.devices      // StateFlow<Map<address, GatewayDeviceState>>: BLE and cloud state, counters, error
+gateway.status       // StateFlow<GatewayStatus>: scan state (and why it failed), network, storage
+gateway.bufferUsage  // StateFlow<BufferUsage>: RAM and flash use against the limits
+```
+
+- `GatewayDeviceState.error` is typed: `DeviceError.kind` is one of `AUTH_REJECTED`, `CLOUD_UNREACHABLE`,
+  `BLUETOOTH`, `DUPLICATE_DEVICE`, with a message for display. All of them are retried.
+- `GatewayStatus.scan` says whether discovery is running — `SCANNING`, `WAITING_FOR_BLUETOOTH`,
+  `RETRYING` (with `scanError`, e.g. a missing permission) or `STOPPED`.
+- Signal strength (`rssi`) is sampled only while something collects `devices`.
+- The library logs to logcat at `INFO` and above, and its lines can contain device IDs. Route them
+  elsewhere, raise the threshold or silence them through `SpotflowLog.logger` / `SpotflowLog.minPriority`.
 
 ## Resilience
 
@@ -190,18 +298,26 @@ flowchart TD
   with a direct connect (about a second when the device is still in range); if that fails, with
   `autoConnect` so Android re-attaches the moment the device reappears, with exponential backoff. A
   device that stays away for 10 minutes is released (freeing one of Android's limited GATT client slots)
-  and picked up again by the scanner when it reappears. The MQTT uplink reconnects on its own too, and the
-  drainer keeps the link warm during idle periods so the status stays connected rather than only
-  reconnecting when the next message arrives.
+  and picked up again by the scanner when it reappears.
+- **Discovery** — the scan runs for the life of the gateway, so it is frugal: `BALANCED` for the first two
+  minutes, to find what is in range quickly, then low-power (known devices reconnect through
+  `autoConnect`, so the scan only has to notice new ones). It is restarted every 25 minutes, inside the
+  30 minutes after which Android throttles a scan, and a scan that fails — which Android reports once and
+  never again — is retried with backoff rather than leaving discovery dead until Bluetooth is toggled.
+- **Network** — the gateway watches the phone's connectivity: with no network, uploads wait for one
+  instead of retrying, and they resume the moment it is back rather than at the end of a backoff. A
+  connection that drops is noticed as it happens — also during a quiet period — and re-established.
 - **Store-and-forward buffer** — a two-tier buffer keeps diagnostics flowing through outages without
   wearing the flash. In steady state messages flow through a small **RAM tier only** (no disk writes);
   once the RAM tier fills (`ramBufferMaxBytes`, default 1 MiB — i.e. the network has been down a while) the
   oldest messages **spill to a crash-safe, byte-bounded SQLite tier** that survives the app being killed
-  or the phone rebooting. Spills are written in batches (one transaction each), so an outage costs
-  occasional flash writes rather than one per message. Total size is bounded by `bufferMaxBytes` (default
-  50 MiB), and everything drains in FIFO order once connectivity returns — whether or not the device is
-  still connected. With `bufferMaxBytes` ≤ `ramBufferMaxBytes` there is no flash tier at all (RAM-only).
-  Trade-off: data still in the RAM tier is lost if the process is killed.
+  or the phone rebooting. Flash is written, read and cleared in batches (one transaction each), so an
+  outage costs occasional flash writes rather than several per message. Total size is bounded by
+  `bufferMaxBytes` (default 50 MiB), and everything drains in FIFO order once connectivity returns —
+  whether or not the device is still connected. With `bufferMaxBytes` ≤ `ramBufferMaxBytes` there is no
+  flash tier at all (RAM-only). Trade-off: data still in the RAM tier is lost if the process is killed.
+  Sizes count each message's payload plus an estimate of the overhead of holding it, so the limits track
+  real use even when messages are tiny.
 - **Shared budget, fair eviction** — both limits apply to the **whole gateway**, however many devices it
   relays, so its footprint is predictable. Each device still has its own queue (it uploads over its own
   MQTT connection, in its own order, and one device's outage never blocks another's uploads), but all
@@ -210,15 +326,27 @@ flowchart TD
   the buffer or stays offline for long therefore gives up its own data before anyone else's. All devices
   share one database (`spotflow_buffer.db`); buffers in the per-device files of versions before 0.1.8 are
   moved into it on first start.
+- **Storage trouble** — the database is opened in the background, never on the thread that creates the
+  gateway. If it cannot be opened (storage full or failing), the gateway keeps relaying with the RAM tier
+  only and says so in `GatewayStatus.storageAvailable`.
 - **Bluetooth off/on** — the gateway watches the Bluetooth adapter itself, so turning Bluetooth off and
   back on tears down and re-establishes sessions automatically — even with the screen off, since it runs in
   the foreground service. (Turning Bluetooth off often doesn't deliver a GATT disconnect callback, which
   would otherwise leave a session parked forever.) The demo app additionally prompts to enable Bluetooth
   before starting and shows a tappable banner if it's turned off while running.
-- **Cloud errors** — a rejected ingest key surfaces the broker's CONNACK reason (e.g.
-  `BAD_USER_NAME_OR_PASSWORD`) as `MqttAuthException` and stops retrying instead of hammering the broker.
-  A message the broker keeps rejecting (a "poison" message) is dropped after a few attempts — also when
-  the broker reacts by disconnecting — so it can't block the rest of the buffer.
+- **Cloud errors** — a rejected ingest key surfaces as `DeviceError.Kind.AUTH_REJECTED` with the broker's
+  CONNACK reason (e.g. `BAD_USER_NAME_OR_PASSWORD`). Instead of hammering the broker, the gateway asks the
+  `CredentialsProvider` again after a pause that grows from one to fifteen minutes — so a rotated or
+  corrected key is picked up — or at once on `retryStopped()`, which also retries the upload of data
+  buffered for devices that are no longer around.
+- **Poison messages** — a message the broker keeps refusing is dropped after 5 refusals; one the broker
+  answers by hanging up, or never acknowledges, after 10 — so it can't block the rest of the buffer. This
+  is judged only while that message is the only one in flight, so a bad message never takes its
+  neighbours with it. A connection lost to the network, or a broker that refuses because the workspace is
+  over its quota, never counts against a message.
+- **Slow and dead uplinks** — an uplink counts as stalled when nothing at all is acknowledged for 20 s,
+  not when one message takes long: a slow link working through a window of core-dump chunks is left
+  alone, a dead one is reconnected.
 
 ## Configuration
 
@@ -226,18 +354,21 @@ flowchart TD
 val gateway = SpotflowGateway(
     context,
     credentials = StaticIngestKey(key),   // or implement CredentialsProvider for rotation / per-device keys
+    deviceFilter = myFilter,
     mqttConfig = MqttConfig(
         bufferMaxBytes = 50L * 1024 * 1024,     // store-and-forward buffer, all devices (RAM + flash)
         ramBufferMaxBytes = 1L * 1024 * 1024,   // RAM tier, all devices; spills to flash only past this
+        keepAliveSeconds = 60,                  // per device connection; shorter costs battery
         // host / port / qos / topics are configurable; defaults target production
     ),
 )
 ```
 
 `SpotflowTopics` (inside `MqttConfig`) lets you override the topic names. `CredentialsProvider` is a
-functional interface, so hosts can resolve the ingest key per device or refresh it on demand.
+functional interface, called on every connection attempt, so hosts can resolve the ingest key per device
+or refresh it on demand.
 
-## Permissions
+## Permissions and manifest
 
 The library declares the BLE, foreground-service and network permissions it needs; hosts merge them
 automatically. Runtime notes:
@@ -247,40 +378,72 @@ automatically. Runtime notes:
 - **Android 11 and older (API ≤ 30):** BLE scanning requires the **Location** permission **and** the
   system Location toggle to be **on** — otherwise scanning silently finds nothing.
 
+Three of the library's declarations merge into the host app's own and are worth knowing about:
+
+- **Location is declared only up to API 30** (`android:maxSdkVersion="30"`). If your app uses location on
+  newer versions too, the merged manifest would cap *your* permission; keep it with
+  `<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" tools:remove="android:maxSdkVersion" />`
+  (and the same for `ACCESS_COARSE_LOCATION`).
+- **`BLUETOOTH_SCAN` is declared `neverForLocation`.** If your app derives location from BLE scans
+  (beacons), remove the flag:
+  `<uses-permission android:name="android.permission.BLUETOOTH_SCAN" tools:remove="android:usesPermissionFlags" />`.
+- **Bluetooth LE is declared as used, not required**, so the library does not narrow the devices your app
+  is offered to on Google Play. If the app is useless without BLE, declare
+  `<uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />` yourself.
+
 ## Building
 
-Requires **JDK 17** and the **Android SDK** (`compileSdk 35`, `minSdk 26`). Point Gradle at the SDK via a
+Requires **JDK 17** and the **Android SDK** (the library compiles against API 35, the demo against 36;
+`minSdk 26`). Point Gradle at the SDK via a
 `local.properties` with `sdk.dir=/path/to/Android/sdk` (or the `ANDROID_HOME` env var).
 
 ```bash
 ./gradlew :spotflow-ble-gateway:testDebugUnitTest   # run the library unit tests (no device needed)
 ./gradlew :spotflow-ble-gateway:assembleRelease     # build the AAR
 ./gradlew :app:assembleDebug                        # build the demo app
+./gradlew :spotflow-ble-gateway:apiDump             # after changing the public API on purpose; commit the result
 ```
 
-CI (`.github/workflows/ci.yml`) runs the library unit tests and lint and builds the demo APK on every
-push to `main` and every pull request. Pushing a `v*` tag runs `.github/workflows/release.yml`, which tests,
-builds the signed release APK and the AAR, and publishes them as a GitHub Release. Bump `versionCode` /
-`versionName` in `app/build.gradle.kts` before tagging, so the APK installs as an update.
+CI (`.github/workflows/ci.yml`) runs the library unit tests, the public-API check and lint, builds the
+release AAR and the demo shrunk by R8 (which checks the library's ProGuard rules), and builds the demo APK
+— on every push to `main` and every pull request.
+
+**Releasing:** set `spotflowVersion` in `gradle.properties` (the one version of the library and the demo;
+the demo's version code is derived from it), commit, and tag that commit `v<version>`. The tag runs
+`.github/workflows/release.yml`, which refuses to continue if the tag and `spotflowVersion` disagree, then
+tests, builds the signed APK, the AAR and its Maven repository, and publishes them as a GitHub Release.
 
 ### Signing
 
 The demo's signing key is never committed. Gradle reads it from `SPOTFLOW_KEYSTORE_FILE`,
 `SPOTFLOW_KEYSTORE_PASSWORD`, `SPOTFLOW_KEY_ALIAS` and `SPOTFLOW_KEY_PASSWORD`; CI decodes the keystore
-from the `SPOTFLOW_KEYSTORE_BASE64` repository secret (plus the three others). With the key, debug and
-release builds are signed identically, so every CI-built APK can update the previous one. Without it,
-local debug builds use your machine's debug key and release builds are unsigned — and the release
-workflow refuses to publish.
+from the `SPOTFLOW_KEYSTORE_BASE64` repository secret (plus the three others). The secrets are handed
+only to the one workflow step that signs, and only for pushes to `main` and release tags: pull-request
+builds are signed with the runner's debug key. With the key, debug and release builds are signed
+identically, so every APK CI builds from `main` can update the previous one. Without it, local debug
+builds use your machine's debug key and release builds are unsigned — and the release workflow refuses to
+publish.
 
 ## Testing
 
-1. **Unit (no hardware):** `FrameCodecTest` covers fragmentation/reassembly incl. the 23-byte MTU,
-   multi-fragment messages, and malformed or incomplete input; `MessageStoreTest` and
-   `StoreAndForwardBufferTest` cover the buffer (FIFO across tiers, the shared budget and fair eviction
-   across devices, migration from per-device files, RAM-only mode); `GatewaySessionTest` covers the orchestration against fake BLE/MQTT (offline buffering,
-   uploading after disconnect, link hand-over, device filter, poison messages, desired configuration
-   incl. its re-send after a device reboot, recovering buffers from an earlier run); `MqttUplinkTest`
-   covers desired-configuration topic matching.
+1. **Unit (no hardware):**
+   - `FrameCodecTest` — fragmentation/reassembly incl. the 23-byte MTU, multi-fragment messages, and
+     malformed or incomplete input.
+   - `MessageStoreTest`, `StoreAndForwardBufferTest` — the buffer: FIFO across tiers, the shared budget and
+     fair eviction across devices, batched reads and deletes, opening lazily and falling back to RAM when
+     the database is unusable, migration from per-device files, RAM-only mode.
+   - `MqttUplinkBrokerTest` — the **real MQTT client** against a scripted local broker: a cancelled
+     connect, a connection lost with a publish in flight, a broker that hangs up or refuses, desired
+     configuration and its acknowledgement. This is what keeps the fake uplink used elsewhere honest.
+   - `GatewaySessionTest` — the orchestration against fake BLE/MQTT: offline buffering, uploading after
+     disconnect, link hand-over, several messages in flight, poison messages, waiting for the network,
+     desired configuration incl. its re-send after a device reboot, recovering buffers from an earlier run.
+   - `SpotflowGatewayTest` — the gateway's own logic against a fake platform, in virtual time: scan retry
+     and restart, the per-device reconnect loop, rejected keys and rejected devices, Bluetooth off/on,
+     data handed over across a restart.
+   - `SpotflowGattSessionTest`, `GattAttachmentTest` — the GATT engine and attach mode against a simulated
+     peripheral: which callback completes which operation, timeouts, attaching to a GATT that is still
+     connecting, detaching.
 2. **On device:** flash the Device SDK BLE sample onto a supported board (e.g. TI CC2340, ESP32-C3/C6,
    Silicon Labs EFR32), install the demo app, enter an ingest key and tap **Start**. Verify diagnostics
    arrive in the Spotflow cloud, then exercise the resilience paths:
@@ -291,3 +454,10 @@ workflow refuses to publish.
    - change the **minimal log severity in the portal** — with the device connected and while it is off;
      the portal leaves "Synchronizing" once the device applies it, and **Received** counts it;
    - **restart the device** after changing the severity — the configured severity is restored.
+
+## License
+
+[Business Source License 1.1](LICENSE.md), on the same terms as the Spotflow Device SDK: the software may
+be used, copied, modified and distributed for the purpose of interacting with the Spotflow Platform; any
+other use needs written consent from Spotflow, s.r.o. Each version changes to Apache 2.0 four years after
+it is published.
