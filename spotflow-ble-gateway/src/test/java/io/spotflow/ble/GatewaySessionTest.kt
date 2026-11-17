@@ -7,6 +7,8 @@ import io.spotflow.ble.cloud.MqttConfig
 import io.spotflow.ble.cloud.BufferPool
 import io.spotflow.ble.cloud.MessageStore
 import io.spotflow.ble.cloud.Uplink
+import io.spotflow.ble.cloud.UplinkDisconnectedException
+import io.spotflow.ble.cloud.UplinkThrottledException
 import io.spotflow.ble.protocol.Message
 import io.spotflow.ble.protocol.MessageType
 import io.spotflow.ble.transport.BleConnection
@@ -14,6 +16,8 @@ import io.spotflow.ble.transport.ConnectionState
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -25,8 +29,10 @@ import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -48,9 +54,15 @@ class GatewaySessionTest {
     /** The flash store, opened after setUp() cleared the databases. */
     private val store by lazy { MessageStore(context, 10_000) }
 
-    private fun registry(scope: CoroutineScope, uplink: FakeUplink): CloudLinkRegistry {
+    private fun registry(
+        scope: CoroutineScope,
+        uplink: FakeUplink,
+        online: StateFlow<Boolean> = MutableStateFlow(true),
+    ): CloudLinkRegistry {
         val pool = BufferPool(store, ramMaxBytes = 1_000, flashMaxBytes = 10_000)
-        return CloudLinkRegistry(scope) { deviceId, push -> CloudLink(deviceId, pool.open(deviceId), uplink, push) }
+        return CloudLinkRegistry(scope) { deviceId, push ->
+            CloudLink(deviceId, pool.open(deviceId), uplink, push, online)
+        }
     }
 
     /** Leaves [payload] on flash for [deviceId], as a run that was killed during an outage would. */
@@ -65,7 +77,8 @@ class GatewaySessionTest {
         ble: FakeBleConnection,
         uplink: FakeUplink,
         links: CloudLinkRegistry = registry(backgroundScope, uplink),
-        filter: DeviceFilter? = null,
+        filter: DeviceFilter = DeviceFilter.AcceptAll,
+        rssiWanted: StateFlow<Boolean>? = null,
         onStatus: (GatewayDeviceState) -> Unit = {},
     ): GatewaySession {
         val address = ble.deviceAddress
@@ -75,7 +88,7 @@ class GatewaySessionTest {
             }
             onStatus(state)
         }
-        return GatewaySession(ble, config, links, push, filter)
+        return GatewaySession(ble, config, links, push, filter, rssiWanted)
     }
 
     @Test
@@ -466,10 +479,275 @@ class GatewaySessionTest {
         assertTrue(uplink.publishedTo("ingest-cbor", byteArrayOf(4, 2)))
         assertTrue("nothing left on flash", store.storedDeviceIds().isEmpty())
     }
+
+    @Test
+    fun `a connection lost to the network never costs a message`() = runTest {
+        val ble = FakeBleConnection()
+        val uplink = FakeUplink()
+        val job = launch { runCatching { session(ble, uplink).run() } }
+        runCurrent()
+
+        uplink.networkDrops = 25 // far more often than any poison limit allows
+        ble.emit(Message(MessageType.TELEMETRY, byteArrayOf(42)))
+        advanceTimeBy(30 * 60_000L); runCurrent()
+
+        assertEquals("every drop was hit", 0, uplink.networkDrops)
+        assertTrue("delivered once the network holds", uplink.publishedTo("ingest-cbor", byteArrayOf(42)))
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `a broker over its quota never costs a message`() = runTest {
+        val ble = FakeBleConnection()
+        val uplink = FakeUplink()
+        val job = launch { runCatching { session(ble, uplink).run() } }
+        runCurrent()
+
+        uplink.throttled = 25 // far more refusals than a bad message is allowed
+        ble.emit(Message(MessageType.TELEMETRY, byteArrayOf(42)))
+        advanceTimeBy(30 * 60_000L); runCurrent()
+
+        assertEquals(0, uplink.throttled)
+        assertTrue("delivered once the broker takes it", uplink.publishedTo("ingest-cbor", byteArrayOf(42)))
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `a slow uplink working through a window is not mistaken for a stalled one`() = runTest {
+        val ble = FakeBleConnection()
+        val uplink = FakeUplink()
+        val job = launch { runCatching { session(ble, uplink).run() } }
+        runCurrent()
+
+        uplink.holdAcks = true
+        repeat(5) { ble.emit(Message(MessageType.TELEMETRY, byteArrayOf(it.toByte()))) }
+        runCurrent()
+        // One acknowledgement every 15 s: the last one arrives after a minute, each within the timeout.
+        repeat(5) {
+            advanceTimeBy(15_000); runCurrent()
+            uplink.acknowledgeOne()
+            runCurrent()
+        }
+
+        assertEquals("never forced to reconnect", 1, uplink.connectCount)
+        assertEquals("nothing sent twice", 5, uplink.published.count { it.first == "ingest-cbor" && it.second.size == 1 })
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `an uplink that stops acknowledging altogether is reconnected`() = runTest {
+        val ble = FakeBleConnection()
+        val uplink = FakeUplink()
+        val job = launch { runCatching { session(ble, uplink).run() } }
+        runCurrent()
+
+        uplink.holdAcks = true
+        repeat(3) { ble.emit(Message(MessageType.TELEMETRY, byteArrayOf(it.toByte()))) }
+        advanceTimeBy(20_001); runCurrent() // nothing acknowledged for the whole timeout
+        uplink.holdAcks = false
+        advanceTimeBy(5_000); runCurrent()
+
+        assertEquals("the stalled connection was replaced", 2, uplink.connectCount)
+        repeat(3) { assertTrue(uplink.published.count { p -> p.second.contentEquals(byteArrayOf(it.toByte())) } >= 2) }
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `desired configuration the broker delivers again is written once and acknowledged for each delivery`() = runTest {
+        val ble = FakeBleConnection().apply { reportsConfiguration = false }
+        val uplink = FakeUplink()
+        var status: GatewayDeviceState? = null
+        val job = launch { runCatching { session(ble, uplink) { status = it }.run() } }
+        runCurrent()
+
+        var acks = 0
+        repeat(3) { uplink.deliverDesired(byteArrayOf(8)) { acks++ } } // redelivered on two reconnects
+        runCurrent()
+        assertEquals("one configuration, however often it was delivered", 1L, status?.received)
+
+        ble.reportConfiguration()
+        runCurrent()
+        assertEquals(1, ble.sentDesiredConfig.size)
+        assertEquals(3, acks)
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `several messages are in flight at once and keep their order`() = runTest {
+        val ble = FakeBleConnection()
+        val uplink = FakeUplink()
+        val job = launch { runCatching { session(ble, uplink).run() } }
+        runCurrent() // session metadata and the reported configuration are through
+
+        uplink.holdAcks = true
+        repeat(5) { ble.emit(Message(MessageType.TELEMETRY, byteArrayOf(it.toByte()))) }
+        runCurrent()
+        assertEquals("all sent before any is acknowledged", 5, uplink.inFlight)
+
+        uplink.acknowledgeAll()
+        runCurrent()
+        val telemetry = uplink.published.filter { it.first == "ingest-cbor" && it.second.size == 1 }
+        assertEquals(listOf(0, 1, 2, 3, 4), telemetry.map { it.second[0].toInt() })
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `a poison message among several in flight does not take the others with it`() = runTest {
+        val ble = FakeBleConnection()
+        val uplink = FakeUplink().apply {
+            poison = { it[0].toInt() == 66 }
+            disconnectOnPoison = true // the broker hangs up, failing everything that was in flight
+        }
+        var status: GatewayDeviceState? = null
+        val job = launch { runCatching { session(ble, uplink) { status = it }.run() } }
+        runCurrent()
+
+        listOf(1, 66, 2, 3).forEach { ble.emit(Message(MessageType.TELEMETRY, byteArrayOf(it.toByte()))) }
+        advanceTimeBy(600_000); runCurrent()
+
+        listOf(1, 2, 3).forEach {
+            assertTrue("message $it delivered", uplink.publishedTo("ingest-cbor", byteArrayOf(it.toByte())))
+        }
+        assertFalse(uplink.publishedTo("ingest-cbor", byteArrayOf(66)))
+        assertEquals("nothing left waiting", 0L, status?.pendingMessages)
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `a lost connection is reported at once and re-established without waiting for data`() = runTest {
+        val ble = FakeBleConnection()
+        val uplink = FakeUplink()
+        var status: GatewayDeviceState? = null
+        val job = launch { runCatching { session(ble, uplink) { status = it }.run() } }
+        runCurrent()
+        assertEquals(true, status?.cloudConnected)
+
+        uplink.loseConnection()
+        assertEquals("reported as it happens", false, status?.cloudConnected)
+
+        runCurrent() // no time passes: the idle drain loop is woken rather than polling
+        assertEquals(2, uplink.connectCount)
+        assertEquals(true, status?.cloudConnected)
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `without a network it waits instead of retrying, and connects the moment one is back`() = runTest {
+        val online = MutableStateFlow(false)
+        val uplink = FakeUplink()
+        val links = registry(backgroundScope, uplink, online)
+        val ble = FakeBleConnection()
+        var status: GatewayDeviceState? = null
+        val job = launch { runCatching { session(ble, uplink, links) { status = it }.run() } }
+        advanceTimeBy(5 * 60_000L); runCurrent()
+
+        assertEquals("no attempts while there is no network", 0, uplink.connectAttempts)
+        assertNull("being offline is not an error", status?.error)
+        assertTrue("still buffering", (status?.pendingMessages ?: 0) > 0)
+
+        online.value = true
+        runCurrent() // no time passes
+        assertEquals(1, uplink.connectCount)
+        assertTrue(uplink.publishedTo("ingest-cbor", "meta".toByteArray()))
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `a failed connect is retried as soon as the network returns`() = runTest {
+        val online = MutableStateFlow(true)
+        val uplink = FakeUplink().apply { failConnect = true }
+        val links = registry(backgroundScope, uplink, online)
+        var status: GatewayDeviceState? = null
+        val job = launch { runCatching { session(FakeBleConnection(), uplink, links) { status = it }.run() } }
+        advanceTimeBy(120_000); runCurrent() // by now the backoff between attempts is at its 30 s maximum
+        assertEquals(DeviceError.Kind.CLOUD_UNREACHABLE, status?.error?.kind)
+        val attempts = uplink.connectAttempts
+
+        online.value = false
+        runCurrent()
+        uplink.failConnect = false
+        online.value = true
+        runCurrent() // no time passes
+
+        assertEquals(attempts + 1, uplink.connectAttempts)
+        assertEquals(true, status?.cloudConnected)
+        assertNull("a working connection clears the cloud error", status?.error)
+        job.cancel()
+    }
+
+    @Test
+    fun `a rejected key is reported as such and the session ends disconnected`() = runTest {
+        val ble = FakeBleConnection()
+        val uplink = FakeUplink().apply { authFail = true }
+        var status: GatewayDeviceState? = null
+        runCatching { session(ble, uplink) { status = it }.run() }
+
+        assertEquals(DeviceError.Kind.AUTH_REJECTED, status?.error?.kind)
+        assertEquals("the BLE link went down with the session", ConnectionState.DISCONNECTED, status?.ble)
+    }
+
+    @Test
+    fun `two sessions claiming one device id during a hand-over cannot both win`() = runTest {
+        leaveOnFlash("test-device", byteArrayOf(1))
+        // The lingering upload takes its time to stop, which is when a second claim used to slip through.
+        val gate = CompletableDeferred<Unit>()
+        val uplink = FakeUplink().apply { connectGate = gate }
+        val links = registry(backgroundScope, uplink)
+        links.recover("test-device")
+        runCurrent()
+
+        val first = async { runCatching { links.claim("test-device") {} } }
+        try {
+            runCurrent() // waiting for the lingering upload to let go
+            assertFalse(first.isCompleted)
+            val second = runCatching { links.claim("test-device") {} }
+            assertTrue("expected DuplicateDeviceException but was $second", second.exceptionOrNull() is DuplicateDeviceException)
+        } finally {
+            gate.complete(Unit) // also when an assertion failed: nothing may be left waiting on it
+        }
+        runCurrent()
+        assertTrue(first.await().isSuccess)
+    }
+
+    @Test
+    fun `the cloud link is handed over only once the session's own upload loop has let go`() = runTest {
+        // The session's loop is in the middle of something it can't drop at once.
+        val gate = CompletableDeferred<Unit>()
+        val uplink = FakeUplink().apply { connectGate = gate }
+        val ble = FakeBleConnection()
+        val job = launch { runCatching { session(ble, uplink).run() } }
+        try {
+            runCurrent()
+
+            ble.drop()
+            runCurrent()
+            assertFalse("the session waits for its loop instead of leaving it running", job.isCompleted)
+            assertEquals("no second loop has started on the link meanwhile", 1, uplink.connectAttempts)
+        } finally {
+            gate.complete(Unit) // also when an assertion failed: nothing may be left waiting on it
+        }
+        runCurrent()
+        assertTrue(job.isCompleted)
+        assertEquals("a link has one consumer at a time", 1, uplink.maxConcurrentConnects)
+    }
+
+    @Test
+    fun `signal strength is read only while someone is watching`() = runTest {
+        val ble = FakeBleConnection()
+        val watching = MutableStateFlow(false)
+        val job = launch { runCatching { session(ble, FakeUplink(), rssiWanted = watching).run() } }
+        advanceTimeBy(60_000); runCurrent()
+        assertEquals(0, ble.rssiReads)
+
+        watching.value = true
+        advanceTimeBy(12_000); runCurrent()
+        assertTrue("expected a few reads but was ${ble.rssiReads}", ble.rssiReads in 2..4)
+        ble.drop(); runCurrent(); job.cancel()
+    }
 }
 
 /** A controllable [BleConnection] for tests. */
-private class FakeBleConnection(
+internal class FakeBleConnection(
     override val deviceAddress: String = "AA:BB:CC:DD:EE:FF",
     private val deviceId: String = "test-device",
 ) : BleConnection {
@@ -483,9 +761,15 @@ private class FakeBleConnection(
 
     val operations = mutableListOf<String>()
     var prepareGate: CompletableDeferred<Unit>? = null
+    /** Makes [prepare] fail, as a connection attempt that doesn't get through would. */
+    var prepareFailure: Throwable? = null
+    var closed = false
+        private set
+
     override suspend fun prepare() {
         stateFlow.value = ConnectionState.CONNECTING
         prepareGate?.await()
+        prepareFailure?.let { throw it }
         operations += "prepare"
         stateFlow.value = ConnectionState.PREPARING
     }
@@ -500,7 +784,8 @@ private class FakeBleConnection(
     fun reportConfiguration() { emit(Message(MessageType.REPORTED_CONFIGURATION, byteArrayOf(0x7E))) }
     override suspend fun readDeviceId(): String { operations += "deviceId"; return deviceId }
     override suspend fun readSessionMetadata(): ByteArray { operations += "metadata"; return "meta".toByteArray() }
-    override suspend fun readRssi() = -55
+    var rssiReads = 0
+    override suspend fun readRssi(): Int { rssiReads++; return -55 }
     override suspend fun sendDesiredConfiguration(payload: ByteArray) {
         if (failDesiredWrites > 0) {
             failDesiredWrites--
@@ -508,42 +793,110 @@ private class FakeBleConnection(
         }
         sentDesiredConfig += payload
     }
-    override suspend fun close() {}
+    override suspend fun close() { closed = true }
 
     fun emit(message: Message) { channel.trySend(message) }
     fun drop() { stateFlow.value = ConnectionState.DISCONNECTED }
 }
 
-/** A controllable [Uplink] for tests. */
-private class FakeUplink : Uplink {
+/**
+ * A controllable [Uplink] for tests. It follows the contract of the real one — in particular, a publish
+ * cut off by a lost connection throws [UplinkDisconnectedException] — which `MqttUplinkBrokerTest` holds
+ * the real client to.
+ */
+internal class FakeUplink : Uplink {
     @Volatile var connected = false
     var failConnect = false
     var authFail = false
     var connectCount = 0
+    var connectAttempts = 0
     var poison: (ByteArray) -> Boolean = { false }
     var disconnectOnPoison = false
+
+    /** The next this-many publishes lose the connection to the network (nothing to do with the message). */
+    var networkDrops = 0
+
+    /** The next this-many publishes are refused because the broker is over its quota. */
+    var throttled = 0
+
+    /** While set, publishes stay in flight until [acknowledgeAll]. */
+    var holdAcks = false
+    private val unacknowledged = ArrayList<CompletableDeferred<Unit>>()
+    val inFlight: Int get() = unacknowledged.size
+    var maxInFlight = 0
+
     val published = mutableListOf<Pair<String, ByteArray>>()
 
     override val isConnected: Boolean get() = connected
     override var desiredConfigurationHandler: ((ByteArray, () -> Unit) -> Unit)? = null
+    override var onConnectionLost: (() -> Unit)? = null
+
+    /** While set, connect() does not return — not even when cancelled — until it completes. */
+    var connectGate: CompletableDeferred<Unit>? = null
+
+    private var connecting = 0
+    var maxConcurrentConnects = 0
 
     override suspend fun connect() {
-        if (authFail) throw MqttAuthException("bad key")
-        if (failConnect) throw RuntimeException("offline")
-        connectCount++
-        connected = true
+        connectAttempts++
+        connecting++
+        maxConcurrentConnects = maxOf(maxConcurrentConnects, connecting)
+        try {
+            connectGate?.let { gate -> withContext(NonCancellable) { gate.await() } }
+            if (authFail) throw MqttAuthException("bad key")
+            if (failConnect) throw RuntimeException("offline")
+            connectCount++
+            connected = true
+        } finally {
+            connecting--
+        }
     }
 
     override suspend fun publish(topic: String, payload: ByteArray) {
-        if (!connected) throw RuntimeException("not connected")
+        if (!connected) throw UplinkDisconnectedException("not connected", rejectedByBroker = false)
+        if (throttled > 0) {
+            throttled--
+            throw UplinkThrottledException("quota exceeded")
+        }
+        if (networkDrops > 0) {
+            networkDrops--
+            connected = false
+            throw UplinkDisconnectedException("connection lost", rejectedByBroker = false)
+        }
         if (poison(payload)) {
-            if (disconnectOnPoison) connected = false
+            if (disconnectOnPoison) {
+                connected = false
+                throw UplinkDisconnectedException("broker hung up", rejectedByBroker = true)
+            }
             throw RuntimeException("rejected")
         }
-        published += topic to payload
+        published += topic to payload // sent, in this order
+        if (holdAcks) {
+            val ack = CompletableDeferred<Unit>()
+            unacknowledged += ack
+            maxInFlight = maxOf(maxInFlight, unacknowledged.size)
+            ack.await()
+        }
     }
 
     override suspend fun disconnect() { connected = false }
+
+    fun acknowledgeAll() {
+        val acks = unacknowledged.toList()
+        unacknowledged.clear()
+        acks.forEach { it.complete(Unit) }
+    }
+
+    /** Acknowledges the oldest publish in flight. */
+    fun acknowledgeOne() {
+        unacknowledged.removeFirstOrNull()?.complete(Unit)
+    }
+
+    /** The connection drops while nothing is being published. */
+    fun loseConnection() {
+        connected = false
+        onConnectionLost?.invoke()
+    }
 
     fun publishedTo(topic: String, payload: ByteArray) =
         published.any { it.first == topic && it.second.contentEquals(payload) }

@@ -9,7 +9,7 @@ package io.spotflow.ble.protocol
  *  - [ACK]/[NACK] are defined by the protocol but acknowledgement is not currently implemented
  *    (delivery is best-effort).
  */
-enum class MessageType(val value: Int) {
+internal enum class MessageType(val value: Int) {
     ACK(0x00),
     NACK(0x01),
     TELEMETRY(0x02),

@@ -8,7 +8,7 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothStatusCodes
 import android.os.Build
-import android.util.Log
+import io.spotflow.ble.Slog
 import io.spotflow.ble.protocol.FrameCodec
 import io.spotflow.ble.protocol.GattProfile
 import io.spotflow.ble.protocol.Message
@@ -23,9 +23,11 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.IOException
+import java.util.UUID
 
 /**
- * The shared GATT engine used by both [ManagedBleConnection] and [AttachedBleConnection].
+ * The shared GATT engine used by both [ManagedBleConnection] and [AttachedBleConnection]. One session
+ * serves one connection and is not reused.
  *
  * It owns the [BluetoothGattCallback] ([callback]) and serializes every GATT operation through a
  * [Mutex] so that only one is outstanding at a time — the single most important correctness rule of the
@@ -33,9 +35,10 @@ import java.io.IOException
  *
  * ## Attach-mode contract
  * In managed mode the library registers [callback] itself via `connectGatt`. In attach mode the host
- * app already owns the `BluetoothGatt` and its own callback; it MUST forward the relevant callback
- * events to [callback] (see [AttachedBleConnection]) and MUST NOT issue competing GATT operations while
- * a Spotflow session is active.
+ * app already owns the `BluetoothGatt` and its own callback; it must forward its callback events to
+ * [callback] and run its own GATT operations inside [exclusive]. As a second line of defence, a callback
+ * only completes the operation it answers: a read or write result for another characteristic — one of
+ * the host's own — is ignored rather than taken for the gateway's.
  */
 internal class SpotflowGattSession(
     private val requestedMtu: Int = MAX_MTU,
@@ -49,6 +52,7 @@ internal class SpotflowGattSession(
         private const val TAG = "SpotflowGatt"
         private const val LARGE_MESSAGE_BYTES = 4096
         private const val OP_TIMEOUT_MS = 10_000L
+        private const val STOP_STREAMING_TIMEOUT_MS = 2_000L
         const val MAX_MTU = 517
 
         /**
@@ -57,7 +61,11 @@ internal class SpotflowGattSession(
          */
         private const val MIN_SUPERVISION_TIMEOUT = 200
         private const val MAX_PRIORITY_REQUESTS = 3
-        private val CCCD_ENABLE_NOTIFICATION = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+    }
+
+    /** An outstanding operation on the characteristic [uuid], completed by the callback that answers it. */
+    private class Pending<T>(val uuid: UUID) {
+        val result = CompletableDeferred<T>()
     }
 
     /**
@@ -88,12 +96,16 @@ internal class SpotflowGattSession(
     @Volatile private var pendingConnect: CompletableDeferred<Unit>? = null
     @Volatile private var pendingDiscover: CompletableDeferred<Unit>? = null
     @Volatile private var pendingMtu: CompletableDeferred<Int>? = null
-    @Volatile private var pendingRead: CompletableDeferred<ByteArray>? = null
-    @Volatile private var pendingWrite: CompletableDeferred<Unit>? = null
-    @Volatile private var pendingDescriptor: CompletableDeferred<Unit>? = null
+    @Volatile private var pendingRead: Pending<ByteArray>? = null
+    @Volatile private var pendingWrite: Pending<Unit>? = null
+
+    /** Keyed by the characteristic whose CCCD is being written. */
+    @Volatile private var pendingDescriptor: Pending<Unit>? = null
     @Volatile private var pendingRssi: CompletableDeferred<Int>? = null
 
-    private var gatt: BluetoothGatt? = null
+    // Written by coroutines and read on binder threads (and the other way round).
+    @Volatile private var gatt: BluetoothGatt? = null
+    @Volatile private var closed = false
     @Volatile private var priorityRequests = 0
     private var txSeq = 0
 
@@ -104,7 +116,7 @@ internal class SpotflowGattSession(
     /** The callback the library registers (managed) or the host forwards to (attached). */
     val callback: BluetoothGattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            this@SpotflowGattSession.gatt = gatt
+            if (!closed) this@SpotflowGattSession.gatt = gatt
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     priorityRequests = 0
@@ -141,7 +153,7 @@ internal class SpotflowGattSession(
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray,
             status: Int,
-        ) = completeRead(value, status)
+        ) = completeRead(characteristic.uuid, value, status)
 
         @Deprecated("Deprecated in API 33")
         @Suppress("DEPRECATION")
@@ -151,7 +163,7 @@ internal class SpotflowGattSession(
             status: Int,
         ) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-                completeRead(characteristic.value ?: ByteArray(0), status)
+                completeRead(characteristic.uuid, characteristic.value ?: ByteArray(0), status)
             }
         }
 
@@ -160,10 +172,11 @@ internal class SpotflowGattSession(
             characteristic: BluetoothGattCharacteristic,
             status: Int,
         ) {
+            val pending = pendingWrite?.takeIf { it.uuid == characteristic.uuid } ?: return
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                pendingWrite?.complete(Unit)
+                pending.result.complete(Unit)
             } else {
-                pendingWrite?.completeExceptionally(IllegalStateException("characteristic write failed: $status"))
+                pending.result.completeExceptionally(IllegalStateException("characteristic write failed: $status"))
             }
         }
 
@@ -172,10 +185,12 @@ internal class SpotflowGattSession(
             descriptor: BluetoothGattDescriptor,
             status: Int,
         ) {
+            if (descriptor.uuid != GattProfile.CCCD) return
+            val pending = pendingDescriptor?.takeIf { it.uuid == descriptor.characteristic?.uuid } ?: return
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                pendingDescriptor?.complete(Unit)
+                pending.result.complete(Unit)
             } else {
-                pendingDescriptor?.completeExceptionally(IllegalStateException("descriptor write failed: $status"))
+                pending.result.completeExceptionally(IllegalStateException("descriptor write failed: $status"))
             }
         }
 
@@ -194,10 +209,10 @@ internal class SpotflowGattSession(
             if (!guardSupervisionTimeout || status != BluetoothGatt.GATT_SUCCESS) return
             if (timeout >= MIN_SUPERVISION_TIMEOUT || priorityRequests >= MAX_PRIORITY_REQUESTS) return
             priorityRequests++
-            Log.i(TAG, "peripheral set a ${timeout * 10} ms supervision timeout; requesting a longer one")
+            Slog.i(TAG, "peripheral set a ${timeout * 10} ms supervision timeout; requesting a longer one")
             @SuppressLint("MissingPermission")
             val requested = runCatching { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED) }
-            if (requested.getOrNull() != true) Log.w(TAG, "connection priority request rejected")
+            if (requested.getOrNull() != true) Slog.w(TAG, "connection priority request rejected")
         }
 
         override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
@@ -232,27 +247,29 @@ internal class SpotflowGattSession(
         val message = reassembler.onFragment(value) ?: return
         if (message.payload.size >= LARGE_MESSAGE_BYTES) {
             // Large TELEMETRY messages are typically coredump chunks; log to aid diagnosis.
-            Log.d(TAG, "reassembled ${message.type} (${message.payload.size} bytes)")
+            Slog.d(TAG, "reassembled ${message.type} (${message.payload.size} bytes)")
         }
         incomingChannel.trySend(message)
     }
 
-    private fun completeRead(value: ByteArray, status: Int) {
+    /** Completes the pending read — if this result is for the characteristic it asked for. */
+    private fun completeRead(uuid: UUID, value: ByteArray, status: Int) {
+        val pending = pendingRead?.takeIf { it.uuid == uuid } ?: return
         if (status == BluetoothGatt.GATT_SUCCESS) {
-            pendingRead?.complete(value.copyOf())
+            pending.result.complete(value.copyOf())
         } else {
-            pendingRead?.completeExceptionally(IllegalStateException("characteristic read failed: $status"))
+            pending.result.completeExceptionally(IllegalStateException("characteristic read failed: $status"))
         }
     }
 
     private fun fail(reason: String) {
-        Log.w(TAG, reason)
+        Slog.w(TAG, reason)
         _state.value = ConnectionState.FAILED
         failAllPending(IllegalStateException(reason))
     }
 
     private fun failAllPending(cause: Throwable) {
-        listOf(pendingConnect, pendingDiscover, pendingRead, pendingWrite, pendingDescriptor, pendingRssi)
+        listOf(pendingConnect, pendingDiscover, pendingRead?.result, pendingWrite?.result, pendingDescriptor?.result, pendingRssi)
             .forEach { it?.completeExceptionally(cause) }
         pendingMtu?.complete(FrameCodec.MIN_MTU)
     }
@@ -282,6 +299,24 @@ internal class SpotflowGattSession(
     }
 
     /**
+     * Attach mode: makes sure the host's GATT is connected before it is used — it may have been handed
+     * over right after `connectGatt`, before the link is up. [isConnected] reports the link's state now;
+     * if it is not up yet, the connection callback is awaited for at most [timeoutMs].
+     */
+    suspend fun awaitConnected(isConnected: () -> Boolean, timeoutMs: Long) {
+        val deferred = CompletableDeferred<Unit>()
+        pendingConnect = deferred // armed before the check, so the callback can't slip in between
+        try {
+            if (isConnected()) return
+            _state.value = ConnectionState.CONNECTING
+            withTimeoutOrNull(timeoutMs) { deferred.await() }
+                ?: throw IOException("the attached GATT did not connect within ${timeoutMs / 1000} s")
+        } finally {
+            pendingConnect = null
+        }
+    }
+
+    /**
      * Discover services and negotiate MTU. TX notifications are enabled separately ([startStreaming]),
      * after the gateway has read the device's characteristics — the order the Spotflow BLE protocol
      * specifies. Some devices don't answer reads once their TX stream is running.
@@ -297,8 +332,26 @@ internal class SpotflowGattSession(
 
     /** Enables TX Stream notifications; messages start flowing on [incoming]. */
     suspend fun startStreaming() = opLock.withLock {
-        enableTxNotifications(requireGatt())
-        _state.value = ConnectionState.READY
+        writeTxCccd(requireGatt(), enable = true)
+        // Only from PREPARING: if the link dropped just now, the state says so and must keep saying so,
+        // or whoever waits for the session to end would wait forever.
+        check(_state.compareAndSet(ConnectionState.PREPARING, ConnectionState.READY)) {
+            "device disconnected while its stream was being started"
+        }
+    }
+
+    /**
+     * Best effort: tells the device to stop its TX stream. For attach mode, where the link stays up after
+     * the gateway lets go — the device would otherwise keep notifying, with nobody listening. Call from a
+     * non-cancellable context when tearing down.
+     */
+    suspend fun stopStreaming() {
+        if (_state.value != ConnectionState.READY) return
+        val g = gatt ?: return
+        val stopped = runCatching {
+            withTimeoutOrNull(STOP_STREAMING_TIMEOUT_MS) { opLock.withLock { writeTxCccd(g, enable = false) } }
+        }
+        if (stopped.getOrNull() == null) Slog.w(TAG, "could not turn the TX stream off before detaching")
     }
 
     @SuppressLint("MissingPermission")
@@ -332,41 +385,47 @@ internal class SpotflowGattSession(
         }
     }
 
+    /** Turns TX Stream notifications on or off, locally and on the device (its CCCD). */
     @SuppressLint("MissingPermission")
-    private suspend fun enableTxNotifications(g: BluetoothGatt) {
+    private suspend fun writeTxCccd(g: BluetoothGatt, enable: Boolean) {
         val tx = characteristic(g, GattProfile.TX_STREAM)
-        check(g.setCharacteristicNotification(tx, true)) { "setCharacteristicNotification rejected" }
+        check(g.setCharacteristicNotification(tx, enable)) { "setCharacteristicNotification rejected" }
         val cccd = tx.getDescriptor(GattProfile.CCCD)
             ?: error("TX Stream is missing its CCCD descriptor")
+        val value = if (enable) {
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        } else {
+            BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+        }
 
-        val deferred = CompletableDeferred<Unit>()
-        pendingDescriptor = deferred
+        val pending = Pending<Unit>(GattProfile.TX_STREAM)
+        pendingDescriptor = pending
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                val status = g.writeDescriptor(cccd, CCCD_ENABLE_NOTIFICATION)
+                val status = g.writeDescriptor(cccd, value)
                 check(status == BluetoothStatusCodes.SUCCESS) { "writeDescriptor rejected: $status" }
             } else {
                 @Suppress("DEPRECATION")
                 run {
-                    cccd.value = CCCD_ENABLE_NOTIFICATION
+                    cccd.value = value
                     check(g.writeDescriptor(cccd)) { "writeDescriptor rejected" }
                 }
             }
-            deferred.awaitOp("enable notifications (CCCD write)")
+            pending.result.awaitOp("${if (enable) "enable" else "disable"} notifications (CCCD write)")
         } finally {
             pendingDescriptor = null
         }
     }
 
     @SuppressLint("MissingPermission")
-    suspend fun read(uuid: java.util.UUID): ByteArray = opLock.withLock {
+    suspend fun read(uuid: UUID): ByteArray = opLock.withLock {
         val g = requireGatt()
         val ch = characteristic(g, uuid)
-        val deferred = CompletableDeferred<ByteArray>()
-        pendingRead = deferred
+        val pending = Pending<ByteArray>(uuid)
+        pendingRead = pending
         try {
             check(g.readCharacteristic(ch)) { "readCharacteristic($uuid) rejected" }
-            deferred.awaitOp("read ${GattProfile.name(uuid)}")
+            pending.result.awaitOp("read ${GattProfile.name(uuid)}")
         } finally {
             pendingRead = null
         }
@@ -399,8 +458,8 @@ internal class SpotflowGattSession(
 
     @SuppressLint("MissingPermission")
     private suspend fun writeNoResponse(g: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray) {
-        val deferred = CompletableDeferred<Unit>()
-        pendingWrite = deferred
+        val pending = Pending<Unit>(ch.uuid)
+        pendingWrite = pending
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 val status = g.writeCharacteristic(ch, value, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
@@ -413,7 +472,7 @@ internal class SpotflowGattSession(
                     check(g.writeCharacteristic(ch)) { "writeCharacteristic rejected" }
                 }
             }
-            deferred.awaitOp("write")
+            pending.result.awaitOp("write")
         } finally {
             pendingWrite = null
         }
@@ -427,27 +486,33 @@ internal class SpotflowGattSession(
 
     @SuppressLint("MissingPermission")
     fun disconnectAndClose() {
-        val g = gatt ?: return
-        runCatching { g.disconnect() }
-        runCatching { g.close() }
+        val g = gatt
+        release()
+        if (g != null) {
+            runCatching { g.disconnect() }
+            runCatching { g.close() }
+        }
+    }
+
+    /** Stop using the (host-owned) GATT without disconnecting it. */
+    fun detach() = release()
+
+    /** Ends this session's use of the GATT; always leaves it DISCONNECTED with the stream closed. */
+    private fun release() {
+        closed = true
         gatt = null
         reassembler.reset()
         incomingChannel.close()
         _state.value = ConnectionState.DISCONNECTED
     }
 
-    /** Stop using the (host-owned) GATT without disconnecting it. */
-    fun detach() {
-        gatt = null
-        reassembler.reset()
-        incomingChannel.close()
-        _state.value = ConnectionState.DISCONNECTED
-    }
+    /** Whether this session has let go of its GATT for good. */
+    val isClosed: Boolean get() = closed
 
     private fun requireGatt(): BluetoothGatt =
         gatt ?: throw IllegalStateException("no GATT attached")
 
-    private fun characteristic(g: BluetoothGatt, uuid: java.util.UUID): BluetoothGattCharacteristic =
+    private fun characteristic(g: BluetoothGatt, uuid: UUID): BluetoothGattCharacteristic =
         g.getService(GattProfile.SERVICE)?.getCharacteristic(uuid)
             ?: error("characteristic $uuid not found in Spotflow service")
 }

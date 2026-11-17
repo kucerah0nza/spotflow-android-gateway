@@ -9,10 +9,12 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import io.spotflow.ble.Slog
 import io.spotflow.ble.SpotflowGateway
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 
 /**
  * A foreground service that hosts a [SpotflowGateway] so relaying continues while the app is backgrounded
@@ -21,7 +23,7 @@ import io.spotflow.ble.SpotflowGateway
  *
  * The host app configures it before starting:
  * ```
- * SpotflowGatewayService.gatewayFactory = { ctx -> SpotflowGateway(ctx, StaticIngestKey(key)) }
+ * SpotflowGatewayService.gatewayFactory = { ctx -> SpotflowGateway(ctx, StaticIngestKey(key), filter) }
  * SpotflowGatewayService.onReady = { gateway -> gateway.startScanning() }
  * SpotflowGatewayService.start(context)
  * ```
@@ -33,7 +35,7 @@ import io.spotflow.ble.SpotflowGateway
  * Host apps that already run their own foreground service (e.g. in attach mode) can skip this class and
  * hold a [SpotflowGateway] directly.
  */
-class SpotflowGatewayService : Service() {
+public class SpotflowGatewayService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -45,7 +47,7 @@ class SpotflowGatewayService : Service() {
         } catch (e: RuntimeException) {
             // e.g. Android 14+ refuses a connectedDevice service once Bluetooth permissions were revoked
             // (possible on a START_STICKY restart). Stop instead of crashing the host app.
-            Log.w(TAG, "cannot enter foreground: ${e.message}; stopping self")
+            Slog.w(TAG, "cannot enter foreground: ${e.message}; stopping self")
             stopSelf()
             return
         }
@@ -54,14 +56,12 @@ class SpotflowGatewayService : Service() {
         if (factory == null) {
             // The process was likely killed and restarted by the system (START_STICKY): the static
             // factory is gone. Stop gracefully rather than crashing; the host re-creates it on next start.
-            Log.w(TAG, "gatewayFactory not set (process restarted?); stopping self")
+            Slog.w(TAG, "gatewayFactory not set (process restarted?); stopping self")
             stopSelf()
             return
         }
 
-        val instance = factory(this)
-        gateway = instance
-        onReady?.invoke(instance)
+        createGateway(factory)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -76,17 +76,28 @@ class SpotflowGatewayService : Service() {
      */
     private fun restartGateway() {
         val factory = gatewayFactory ?: return
-        Log.i(TAG, "restarting the gateway")
-        gateway?.shutdown()
-        gateway = null
-        val instance = factory(this)
-        gateway = instance
+        Slog.i(TAG, "restarting the gateway")
+        _gateway.value?.shutdown()
+        _gateway.value = null
+        createGateway(factory)
+    }
+
+    private fun createGateway(factory: (Context) -> SpotflowGateway) {
+        val instance = try {
+            factory(this)
+        } catch (e: RuntimeException) {
+            // The host's factory failed. Without a gateway there is nothing to keep running.
+            Slog.e(TAG, "gatewayFactory failed; stopping self", e)
+            stopSelf()
+            return
+        }
+        _gateway.value = instance
         onReady?.invoke(instance)
     }
 
     override fun onDestroy() {
-        gateway?.shutdown()
-        gateway = null
+        _gateway.value?.shutdown()
+        _gateway.value = null
         super.onDestroy()
     }
 
@@ -116,33 +127,40 @@ class SpotflowGatewayService : Service() {
             .build()
     }
 
-    companion object {
+    public companion object {
         private const val TAG = "SpotflowGateway"
-        const val CHANNEL_ID = "spotflow_gateway"
+        public const val CHANNEL_ID: String = "spotflow_gateway"
         private const val NOTIFICATION_ID = 4711
         private const val ACTION_RESTART = "io.spotflow.ble.action.RESTART_GATEWAY"
 
         /** Builds the [SpotflowGateway] the service will host. Required. */
         @Volatile
-        var gatewayFactory: ((Context) -> SpotflowGateway)? = null
+        public var gatewayFactory: ((Context) -> SpotflowGateway)? = null
 
         /**
          * Optional custom foreground notification (branding). Falls back to a default. The provider must
          * create its own notification channel.
          */
         @Volatile
-        var notificationProvider: ((Context) -> Notification)? = null
+        public var notificationProvider: ((Context) -> Notification)? = null
 
         /** Called once the gateway is created; typically calls `gateway.startScanning()`. */
         @Volatile
-        var onReady: ((SpotflowGateway) -> Unit)? = null
+        public var onReady: ((SpotflowGateway) -> Unit)? = null
 
-        /** The live gateway instance while the service runs, for observing [SpotflowGateway.devices]. */
-        @Volatile
-        var gateway: SpotflowGateway? = null
-            private set
+        private val _gateway = MutableStateFlow<SpotflowGateway?>(null)
 
-        fun start(context: Context) {
+        /**
+         * The gateway the service is hosting, or null while it isn't running. Collect it to follow the
+         * gateway across [restart]s (each one creates a new instance) and observe its
+         * [SpotflowGateway.devices] and [SpotflowGateway.status].
+         */
+        public val gatewayFlow: StateFlow<SpotflowGateway?> get() = _gateway
+
+        /** The live gateway instance while the service runs; see [gatewayFlow] to observe it. */
+        public val gateway: SpotflowGateway? get() = _gateway.value
+
+        public fun start(context: Context) {
             ContextCompat.startForegroundService(context, Intent(context, SpotflowGatewayService::class.java))
         }
 
@@ -151,7 +169,7 @@ class SpotflowGatewayService : Service() {
          * since the service never leaves the foreground. Starts it if it isn't running. Call it while the
          * app is in the foreground, as Android limits starting services from the background.
          */
-        fun restart(context: Context) {
+        public fun restart(context: Context) {
             if (gateway == null) {
                 start(context)
             } else {
@@ -159,7 +177,7 @@ class SpotflowGatewayService : Service() {
             }
         }
 
-        fun stop(context: Context) {
+        public fun stop(context: Context) {
             context.stopService(Intent(context, SpotflowGatewayService::class.java))
         }
     }

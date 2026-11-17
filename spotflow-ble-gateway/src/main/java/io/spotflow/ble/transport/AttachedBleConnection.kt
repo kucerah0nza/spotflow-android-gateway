@@ -1,41 +1,36 @@
 package io.spotflow.ble.transport
 
 import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
 import io.spotflow.ble.protocol.GattProfile
+import io.spotflow.ble.protocol.Message
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 
 /**
- * A [BleConnection] that attaches to a `BluetoothGatt` the host app already owns — e.g. a smart
- * thermostat app that is already connected to its device and does not want a second GATT connection.
+ * A [BleConnection] on a `BluetoothGatt` the host app owns — e.g. a smart thermostat app that is already
+ * connected to its device and does not want a second GATT connection. Hosts reach it through
+ * `GattAttachment`, which documents the contract (forwarding callbacks, `runExclusive`).
  *
- * ## Host contract
- * The host retains ownership of connect/disconnect and MUST:
- *  1. Forward its `BluetoothGattCallback` events to [gattCallback] (use it directly as the connectGatt
- *     callback, or fan out to it from the host's own callback), and
- *  2. Run its own GATT operations through [runExclusive] while attached (the Android stack allows only
- *     one outstanding GATT operation at a time, so unsynchronized operations would collide).
- *
- * [prepare] assumes the GATT is already connected; it discovers services and negotiates MTU, and
- * [startStreaming] enables TX notifications. [close] detaches without disconnecting the host's GATT.
+ * [prepare] waits for the GATT to be connected if it isn't yet, then discovers services and negotiates
+ * MTU. [close] turns the device's TX stream off and detaches, without disconnecting the host's GATT.
  */
-class AttachedBleConnection(
+internal class AttachedBleConnection(
     private val gatt: BluetoothGatt,
-    requestedMtu: Int = SpotflowGattSession.MAX_MTU,
+    private val session: SpotflowGattSession,
+    /** Whether the host's GATT link is up right now. */
+    private val isLinkUp: () -> Boolean,
 ) : BleConnection {
-
-    private val session = SpotflowGattSession(requestedMtu).apply { attachGatt(gatt) }
-
-    /** The callback the host app must forward GATT events to. */
-    val gattCallback: BluetoothGattCallback get() = session.callback
 
     override val deviceAddress: String get() = gatt.device.address
     override val state: StateFlow<ConnectionState> get() = session.state
-    override val incoming: Flow<io.spotflow.ble.protocol.Message> get() = session.incoming
+    override val incoming: Flow<Message> get() = session.incoming
     override val mtu: Int get() = session.mtu
 
-    override suspend fun prepare() = session.prepare()
+    override suspend fun prepare() {
+        session.attachGatt(gatt)
+        session.awaitConnected(isLinkUp, CONNECT_WAIT_MS)
+        session.prepare()
+    }
 
     override suspend fun readProtocolVersion(): Int =
         session.read(GattProfile.CAPABILITIES).firstOrNull()?.toInt()?.and(0xFF)
@@ -54,12 +49,17 @@ class AttachedBleConnection(
     override suspend fun sendDesiredConfiguration(payload: ByteArray) =
         session.writeDesiredConfiguration(payload)
 
-    override suspend fun close() = session.detach()
+    override suspend fun close() {
+        // The host's link stays up after us: without this the device would keep streaming to nobody.
+        session.stopStreaming()
+        session.detach()
+    }
 
-    /**
-     * Runs [block] while holding the GATT operation queue, so the host's own operations (issued on
-     * [gatt] inside [block], awaiting their own callbacks) never overlap with the gateway's. Keep blocks
-     * short: gateway operations — e.g. writing desired configuration — wait meanwhile.
-     */
+    /** Runs [block] while holding the GATT operation queue; see `GattAttachment.runExclusive`. */
     suspend fun <T> runExclusive(block: suspend (BluetoothGatt) -> T): T = session.exclusive { block(gatt) }
+
+    private companion object {
+        /** How long a GATT handed over before it is connected may take to connect. */
+        const val CONNECT_WAIT_MS = 30_000L
+    }
 }

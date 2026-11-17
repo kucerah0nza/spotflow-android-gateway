@@ -20,9 +20,16 @@ class StoreAndForwardBufferTest {
 
     private fun payload(marker: Int, size: Int = 40) = ByteArray(size) { marker.toByte() }
 
-    private fun open(ramMaxBytes: Long, diskMaxBytes: Long = 10_000, spill: Boolean = true) {
-        store = MessageStore(context, diskMaxBytes)
-        pool = BufferPool(store, ramMaxBytes, flashMaxBytes = if (spill) diskMaxBytes else 0)
+    /** Sizes are payload bytes only unless a test asks for the per-message overheads. */
+    private fun open(
+        ramMaxBytes: Long,
+        diskMaxBytes: Long = 10_000,
+        spill: Boolean = true,
+        itemOverhead: Long = 0,
+        rowOverhead: Long = 0,
+    ) {
+        store = MessageStore(context, diskMaxBytes, rowOverhead)
+        pool = BufferPool(store, ramMaxBytes, flashMaxBytes = if (spill) diskMaxBytes else 0, itemOverhead)
         buffer = pool.open("dev")
     }
 
@@ -230,7 +237,7 @@ class StoreAndForwardBufferTest {
         buffer.enqueue("t", payload(1))
         buffer.enqueue("t", payload(2)) // the old gateway still holds these in RAM
 
-        val restarted = BufferPool(store, 10_000, flashMaxBytes = 10_000).open("dev")
+        val restarted = BufferPool(store, 10_000, flashMaxBytes = 10_000, itemOverheadBytes = 0).open("dev")
         restarted.enqueue("t", payload(3))
         buffer.flushToDisk() // the old gateway flushes only after the new one started
         buffer.close()
@@ -247,7 +254,139 @@ class StoreAndForwardBufferTest {
         val a = pool.open("a")
         pool.shutdown()
         assertTrue("a buffer is still open", !released)
+        assertEquals("nothing handed over yet", 0, store.handoffs.value)
         a.close()
         assertTrue(released)
+        assertEquals("a running gateway is told there may be data to pick up", 1, store.handoffs.value)
+    }
+
+    @Test
+    fun `peek hands out a window in order, flash before RAM`() {
+        open(ramMaxBytes = 10_000)
+        buffer.enqueue("t", payload(1))
+        buffer.enqueue("t", payload(2))
+        buffer.flushToDisk()
+        buffer.enqueue("t", payload(3))
+        buffer.enqueue("t", payload(4))
+
+        assertEquals(listOf(1, 2, 3), buffer.peek(maxItems = 3).map { it.payload[0].toInt() })
+        assertEquals("peeking takes nothing out", 4L, buffer.count)
+        assertEquals("the payload limit ends the window early", 2, buffer.peek(maxItems = 10, maxPayloadBytes = 90).size)
+        assertEquals("but never below one message", 1, buffer.peek(maxItems = 10, maxPayloadBytes = 1).size)
+    }
+
+    @Test
+    fun `items of a window can be removed in any order`() {
+        open(ramMaxBytes = 10_000)
+        buffer.enqueue("t", payload(1))
+        buffer.flushToDisk()
+        buffer.enqueue("t", payload(2))
+        buffer.enqueue("t", payload(3))
+        val (one, two, three) = buffer.peek(maxItems = 3)
+
+        buffer.remove(three) // acknowledged first
+        assertEquals(listOf(1, 2), buffer.peek(maxItems = 3).map { it.payload[0].toInt() })
+        buffer.remove(one)
+        buffer.remove(two)
+        assertTrue(buffer.isEmpty)
+        assertEquals(0L, pool.ramBytes)
+        assertEquals(0L, store.bytes)
+    }
+
+    @Test
+    fun `flash is read ahead and cleared a batch at a time`() {
+        open(ramMaxBytes = 10_000)
+        repeat(3) { buffer.enqueue("t", payload(it + 1)) }
+        buffer.flushToDisk()
+
+        buffer.remove(buffer.takeNext()!!)
+        assertEquals("the published row stays until its batch is through", 3L, store.count("dev"))
+        assertEquals("but no longer counts as waiting", 2L, buffer.count)
+        assertEquals(80L, buffer.diskBytes)
+
+        buffer.remove(buffer.takeNext()!!)
+        buffer.remove(buffer.takeNext()!!)
+        assertEquals("the batch is deleted together", 0L, store.count("dev"))
+        assertTrue(buffer.isEmpty)
+    }
+
+    @Test
+    fun `RAM waits until flash is through, also beyond what is read ahead`() {
+        open(ramMaxBytes = 100_000, diskMaxBytes = 100_000)
+        repeat(70) { buffer.enqueue("t", payload(it + 1, size = 1)) } // more rows than one read-ahead
+        buffer.flushToDisk()
+        buffer.enqueue("t", payload(99, size = 1))
+
+        val first = buffer.peek(maxItems = 100)
+        assertEquals("only what was read ahead: older rows are still in flash", 64, first.size)
+        first.forEach(buffer::remove)
+
+        val rest = buffer.peek(maxItems = 100)
+        assertEquals(listOf(65, 66, 67, 68, 69, 70, 99), rest.map { it.payload[0].toInt() })
+    }
+
+    @Test
+    fun `closing commits the published part of a batch`() {
+        open(ramMaxBytes = 10_000)
+        repeat(3) { buffer.enqueue("t", payload(it + 1)) }
+        buffer.flushToDisk()
+        buffer.remove(buffer.takeNext()!!)
+
+        buffer.close()
+
+        assertEquals("only the unpublished rows are left for the next run", 2L, store.count("dev"))
+        assertEquals(2L, store.peek("dev")!!.seq)
+    }
+
+    @Test
+    fun `rows evicted while read ahead are not handed out again`() {
+        open(ramMaxBytes = 40, diskMaxBytes = 120)
+        buffer.enqueue("t", payload(1))
+        buffer.enqueue("t", payload(2)) // both spill to flash
+        val inFlight = buffer.takeNext()!! // reads 1 and 2 ahead; 1 is being published
+
+        buffer.enqueue("t", payload(3))
+        buffer.enqueue("t", payload(4)) // spills 3 and 4: flash is over its limit and 1 is evicted
+
+        assertEquals(listOf(2, 3, 4), buffer.peek(maxItems = 10).map { it.payload[0].toInt() })
+        buffer.remove(inFlight) // its publish completes anyway: nothing left to delete
+        assertEquals(listOf(2, 3, 4), buffer.drainMarkers())
+    }
+
+    @Test
+    fun `a message arriving after close is dropped rather than leaking budget`() {
+        open(ramMaxBytes = 10_000)
+        buffer.close()
+
+        buffer.enqueue("t", payload(1))
+
+        assertEquals(0L, pool.ramBytes)
+        assertNull(buffer.takeNext())
+    }
+
+    @Test
+    fun `sizes include the overhead of holding a message`() {
+        open(ramMaxBytes = 10_000, itemOverhead = 10, rowOverhead = 20)
+        buffer.enqueue("t", payload(1, size = 5))
+        assertEquals(15L, buffer.ramBytes)
+        assertEquals(15L, pool.usage.value.ramBytes)
+
+        buffer.flushToDisk()
+        assertEquals(0L, buffer.ramBytes)
+        assertEquals(25L, buffer.diskBytes)
+        assertEquals(25L, pool.usage.value.flashBytes)
+    }
+
+    @Test
+    fun `when flash cannot be used the pool drops instead of spilling`() {
+        // A directory where the database file should be: it can't be opened.
+        context.getDatabasePath("spotflow_buffer.db").mkdirs()
+        open(ramMaxBytes = 100)
+
+        repeat(4) { buffer.enqueue("t", payload(it + 1)) } // 160 bytes > 100
+
+        assertEquals(false, pool.storeAvailable.value)
+        assertTrue("RAM stays bounded", pool.ramBytes <= 100)
+        assertEquals("the newest survive", listOf(3, 4), buffer.drainMarkers())
     }
 }

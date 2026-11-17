@@ -20,12 +20,19 @@ import kotlinx.coroutines.flow.callbackFlow
  * gave up on is picked up again once it is back in range.
  *
  * Requires `BLUETOOTH_SCAN` (API 31+) or `BLUETOOTH_ADMIN` + location (<= API 30). The returned flow
- * scans while collected and stops on cancellation.
+ * scans while collected and stops on cancellation; it fails if the scan cannot be started or stops
+ * working. The caller restarts it — also periodically, as Android throttles a scan left running for
+ * 30 minutes.
  */
-class SpotflowScanner(private val adapter: BluetoothAdapter) {
+internal class SpotflowScanner(private val adapter: BluetoothAdapter) {
 
+    /**
+     * @param lowPower scan at a low duty cycle. Discovery takes a little longer (seconds rather than a
+     *   second), which is the right trade for a scan that runs for the life of the gateway. Without it
+     *   the scan is `BALANCED`: quicker, for the first minutes after starting.
+     */
     @SuppressLint("MissingPermission")
-    fun scan(): Flow<BluetoothDevice> = callbackFlow {
+    fun scan(lowPower: Boolean): Flow<BluetoothDevice> = callbackFlow {
         val scanner = adapter.bluetoothLeScanner
             ?: throw IllegalStateException("BLE scanner unavailable (Bluetooth off?)")
 
@@ -33,10 +40,9 @@ class SpotflowScanner(private val adapter: BluetoothAdapter) {
         val filter = ScanFilter.Builder()
             .setServiceUuid(ParcelUuid(GattProfile.SERVICE))
             .build()
-        // BALANCED rather than LOW_LATENCY: this scan runs continuously for the life of the gateway, so
-        // it must be power-friendly. Discovery of a new device just takes a little longer.
+        // Never LOW_LATENCY: this scan runs continuously, so it must be power-friendly.
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
+            .setScanMode(if (lowPower) ScanSettings.SCAN_MODE_LOW_POWER else ScanSettings.SCAN_MODE_BALANCED)
             .build()
 
         val callback = object : ScanCallback() {
@@ -51,7 +57,7 @@ class SpotflowScanner(private val adapter: BluetoothAdapter) {
             }
 
             override fun onScanFailed(errorCode: Int) {
-                close(IllegalStateException("BLE scan failed: $errorCode"))
+                close(IllegalStateException("BLE scan failed (error $errorCode)"))
             }
         }
 

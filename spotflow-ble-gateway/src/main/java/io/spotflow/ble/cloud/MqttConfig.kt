@@ -1,27 +1,43 @@
 package io.spotflow.ble.cloud
 
-import com.hivemq.client.mqtt.datatypes.MqttQos
-
 /**
- * MQTT topic names on the Spotflow broker. Kept configurable because whether these are literal or
- * device-ID-templated is still being confirmed with the Spotflow backend.
+ * MQTT topic names on the Spotflow broker. Telemetry and reported configuration are published to fixed
+ * topics; desired configuration arrives on a per-device topic *below* [desiredConfiguration]
+ * (`config-cbor-c2d/<workspace>/<device>`), so that one is matched by prefix.
  */
-data class SpotflowTopics(
+public data class SpotflowTopics(
     val ingest: String = "ingest-cbor",
     val reportedConfiguration: String = "config-cbor-d2c",
     val desiredConfiguration: String = "config-cbor-c2d",
 )
 
+/** MQTT delivery guarantee for the messages the gateway publishes. */
+public enum class PublishQos {
+    /** Fire and forget: a message is dropped from the buffer as soon as it is written to the socket. */
+    AT_MOST_ONCE,
+
+    /** A message stays buffered until the broker acknowledges it; it may be delivered twice. */
+    AT_LEAST_ONCE,
+
+    /** Like [AT_LEAST_ONCE], with the broker de-duplicating within one connection. */
+    EXACTLY_ONCE,
+}
+
 /**
  * Connection settings for the Spotflow MQTT broker. Defaults target production: `mqtt.spotflow.io:8883`
  * over TLS (Let's Encrypt ISRG Root X1, validated by the Android system trust store) with QoS 1.
  */
-data class MqttConfig(
+public data class MqttConfig(
     val host: String = "mqtt.spotflow.io",
     val port: Int = 8883,
     val useTls: Boolean = true,
-    val keepAliveSeconds: Int = 30,
-    val qos: MqttQos = MqttQos.AT_LEAST_ONCE,
+    /**
+     * MQTT keep-alive. Every device has its own connection, each pinging at this interval while idle, so
+     * a short one costs battery on mobile data. A dead link is noticed sooner than this whenever there is
+     * data to send (publishes time out), so the default favours battery.
+     */
+    val keepAliveSeconds: Int = 60,
+    val qos: PublishQos = PublishQos.AT_LEAST_ONCE,
     val topics: SpotflowTopics = SpotflowTopics(),
     /**
      * Max size of the store-and-forward buffer for the whole gateway — all devices together — in bytes
@@ -30,6 +46,9 @@ data class MqttConfig(
      * first, so one flooding or long-offline device can't push out the others. Default 50 MiB. If this is
      * not larger than [ramBufferMaxBytes] there is no flash tier: the buffer is RAM-only and never writes
      * to flash.
+     *
+     * Sizes count each message's payload plus a fixed estimate of what holding it costs (object headers
+     * in RAM; row and index overhead in flash), so the limit tracks real use even for tiny messages.
      */
     val bufferMaxBytes: Long = 50L * 1024 * 1024,
 

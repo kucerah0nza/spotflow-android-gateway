@@ -1,8 +1,14 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.binary.compatibility.validator)
     `maven-publish`
 }
+
+// One version for the library and the demo app, set in the root gradle.properties.
+val spotflowVersion: String = providers.gradleProperty("spotflowVersion").get()
 
 android {
     namespace = "io.spotflow.ble"
@@ -28,10 +34,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
     publishing {
         singleVariant("release") {
             withSourcesJar()
@@ -44,11 +46,21 @@ android {
     }
 }
 
+kotlin {
+    // Everything public is public on purpose: a declaration without a visibility modifier doesn't compile.
+    explicitApi()
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+    }
+}
+
 dependencies {
-    implementation(libs.kotlinx.coroutines.core)
+    // `api`: StateFlow is part of the public API (SpotflowGateway.devices, …).
+    api(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.core.ktx)
-    api(libs.hivemq.mqtt.client)
+    // An implementation detail: no MQTT type appears in the public API.
+    implementation(libs.hivemq.mqtt.client)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
@@ -62,7 +74,7 @@ publishing {
         register<MavenPublication>("release") {
             groupId = "io.spotflow"
             artifactId = "spotflow-ble-gateway"
-            version = "0.1.0"
+            version = spotflowVersion
 
             afterEvaluate {
                 from(components["release"])
@@ -72,8 +84,24 @@ publishing {
                 name.set("Spotflow BLE Gateway")
                 description.set("Android library that relays Spotflow BLE device diagnostics to the Spotflow cloud.")
                 url.set("https://spotflow.io")
+                licenses {
+                    license {
+                        // The same licence as the Spotflow Device SDK; see LICENSE.md in the repository.
+                        name.set("Business Source License 1.1")
+                        url.set("https://github.com/kucerah0nza/spotflow-android-gateway/blob/main/LICENSE.md")
+                        distribution.set("repo")
+                    }
+                }
             }
         }
     }
-    // Publish target intentionally left unconfigured for now (not published to Maven Central yet).
+    repositories {
+        // A Maven repository in a directory. The release workflow zips it and attaches it to the GitHub
+        // Release, so integrators get the AAR *with* its POM — and so its dependencies — rather than a
+        // bare .aar. Not published to Maven Central yet.
+        maven {
+            name = "dist"
+            url = uri(rootProject.layout.buildDirectory.dir("maven-repo"))
+        }
+    }
 }

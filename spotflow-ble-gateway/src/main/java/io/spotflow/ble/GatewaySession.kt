@@ -1,59 +1,20 @@
 package io.spotflow.ble
 
-import android.util.Log
 import io.spotflow.ble.cloud.MqttConfig
 import io.spotflow.ble.protocol.MessageType
 import io.spotflow.ble.transport.BleConnection
 import io.spotflow.ble.transport.ConnectionState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-
-/** Observable state of one device being gatewayed, surfaced to the host app / demo UI. */
-data class GatewayDeviceState(
-    val address: String,
-    val deviceId: String? = null,
-    val ble: ConnectionState = ConnectionState.DISCONNECTED,
-    val cloudConnected: Boolean = false,
-    /** Messages delivered to the cloud for this device since the gateway started (across reconnects). */
-    val forwarded: Long = 0,
-    /**
-     * Messages received from the cloud for this device (desired configuration, e.g. a new minimal log
-     * severity) since the gateway started, across reconnects — counted on arrival, before they are
-     * written to the device.
-     */
-    val received: Long = 0,
-    /** Latest BLE signal strength in dBm (higher/closer to 0 is stronger), or null if not yet read. */
-    val rssi: Int? = null,
-    /** Messages buffered for this device, waiting to be uploaded (RAM and flash). */
-    val pendingMessages: Long = 0,
-    /** Bytes buffered in the in-memory tier (normal while briefly offline). */
-    val ramBytes: Long = 0,
-    /** Bytes spilled to the persistent (flash) tier (only after a longer outage). */
-    val diskBytes: Long = 0,
-    val error: String? = null,
-)
-
-/**
- * Decides which devices the gateway relays. Called after the device ID has been read, before anything is
- * sent to the cloud under that ID.
- *
- * Managed mode connects to anything advertising the Spotflow service, and the BLE protocol does not
- * authenticate devices — so without a filter, any nearby peripheral could publish data (and receive
- * desired configuration) under any device ID in your workspace. Production integrations should accept
- * only the devices they expect (e.g. an allowlist, or IDs provisioned to the signed-in user).
- */
-fun interface DeviceFilter {
-    fun accept(address: String, deviceId: String): Boolean
-}
-
-/** Thrown when [DeviceFilter] rejects a device (or it reports an unusable device ID). Not retried. */
-class DeviceRejectedException(message: String) : Exception(message)
 
 /**
  * Bridges a single [BleConnection] to the device's [CloudLink].
@@ -72,9 +33,12 @@ internal class GatewaySession(
      * and cloud state the link reports carry over across BLE reconnects instead of being reset.
      */
     private val status: StatusPush,
-    private val deviceFilter: DeviceFilter? = null,
-    /** Periodically read RSSI. Off for attached connections, whose GATT queue belongs to the host. */
-    private val pollRssi: Boolean = true,
+    private val deviceFilter: DeviceFilter = DeviceFilter.AcceptAll,
+    /**
+     * Whether anyone is looking at the signal strength right now; RSSI is read periodically while it is
+     * true. `null` never reads it — for attached connections, whose GATT queue belongs to the host.
+     */
+    private val rssiWanted: Flow<Boolean>? = null,
 ) {
     /** Runs until the connection is torn down or the coroutine is cancelled. */
     suspend fun run() = coroutineScope {
@@ -94,21 +58,23 @@ internal class GatewaySession(
             try {
                 val version = connection.readProtocolVersion()
                 if (version != SUPPORTED_PROTOCOL_VERSION) {
-                    Log.w(TAG, "device reports protocol version $version; this gateway speaks $SUPPORTED_PROTOCOL_VERSION")
+                    Slog.w(TAG, "device reports protocol version $version; this gateway speaks $SUPPORTED_PROTOCOL_VERSION")
                 }
             } catch (c: CancellationException) {
                 throw c
             } catch (t: Throwable) {
-                Log.w(TAG, "could not read protocol version: ${t.message}")
+                Slog.w(TAG, "could not read protocol version: ${t.message}")
             }
             val deviceId = connection.readDeviceId()
             if (deviceId.isBlank()) throw DeviceRejectedException("device reported an empty device ID")
             push { it.copy(deviceId = deviceId) }
-            if (deviceFilter?.accept(connection.deviceAddress, deviceId) == false) {
+            if (!deviceFilter.accept(connection.deviceAddress, deviceId)) {
                 throw DeviceRejectedException("device $deviceId rejected by the device filter")
             }
 
             val link = links.claim(deviceId, push)
+            // Everything of this session that uses the link; see the hand-over below.
+            val linkUsers = ArrayList<Job>()
             try {
                 try {
                     link.enqueue(mqttConfig.topics.ingest, connection.readSessionMetadata())
@@ -116,7 +82,7 @@ internal class GatewaySession(
                     throw c
                 } catch (t: Throwable) {
                     // Optional characteristic; relaying works without it.
-                    Log.w(TAG, "session metadata unavailable for $deviceId: ${t.message}")
+                    Slog.w(TAG, "session metadata unavailable for $deviceId: ${t.message}")
                 }
 
                 // Completed by the device's first reported configuration this session. The Device SDK
@@ -125,13 +91,13 @@ internal class GatewaySession(
                 val deviceAcceptsConfiguration = CompletableDeferred<Unit>()
 
                 // BLE -> buffer (RAM first; never blocks on the network).
-                val pump = launch {
+                linkUsers += launch {
                     connection.incoming.collect { message ->
                         val topic = when (message.type) {
                             MessageType.TELEMETRY -> mqttConfig.topics.ingest
                             MessageType.REPORTED_CONFIGURATION -> {
                                 if (deviceAcceptsConfiguration.complete(Unit)) {
-                                    Log.i(TAG, "$deviceId reported its configuration; desired configuration can be delivered")
+                                    Slog.d(TAG, "$deviceId reported its configuration; desired configuration can be delivered")
                                 }
                                 mqttConfig.topics.reportedConfiguration
                             }
@@ -142,12 +108,12 @@ internal class GatewaySession(
                 }
 
                 // Buffer -> MQTT, owning connect/reconnect so offline just keeps buffering.
-                val drainer = launch { link.drain(stopWhenEmpty = false) }
+                linkUsers += launch { link.drain(stopWhenEmpty = false) }
 
                 // Cloud -> device, in order, acknowledged to the broker only once written — and only once
                 // the device can take it (see above). A device that never reports configuration doesn't
                 // support it, so pending desired configuration then stays queued rather than being lost.
-                val desired = launch {
+                linkUsers += launch {
                     deviceAcceptsConfiguration.await()
                     link.deliverDesiredConfiguration { connection.sendDesiredConfiguration(it) }
                 }
@@ -155,10 +121,11 @@ internal class GatewaySession(
                 // Reads are done: start the device's TX stream.
                 connection.startStreaming()
 
-                // Periodically sample the BLE signal strength for the UI.
-                val rssiJob = if (pollRssi) {
+                // Sample the BLE signal strength, but only while someone is watching it.
+                val rssiJob = rssiWanted?.let { wanted ->
                     launch {
                         while (true) {
+                            wanted.first { it }
                             try {
                                 val rssi = connection.readRssi()
                                 push { it.copy(rssi = rssi) }
@@ -170,8 +137,6 @@ internal class GatewaySession(
                             delay(RSSI_INTERVAL_MS)
                         }
                     }
-                } else {
-                    null
                 }
 
                 try {
@@ -179,19 +144,26 @@ internal class GatewaySession(
                         it == ConnectionState.DISCONNECTED || it == ConnectionState.FAILED
                     }
                 } finally {
-                    pump.cancel()
-                    drainer.cancel()
-                    desired.cancel()
                     rssiJob?.cancel()
                 }
             } finally {
                 // NonCancellable so the hand-off runs even when the session is cancelled (Stop /
                 // Bluetooth off) — the link then lingers to upload (or at least persist) what's buffered.
-                withContext(NonCancellable) { links.release(link) }
+                withContext(NonCancellable) {
+                    // The link is handed over only once this session has really let go of it: releasing
+                    // it starts another drain loop, and a link has a single consumer. Cancelling without
+                    // waiting would leave this session's loop running next to that one for a moment.
+                    linkUsers.forEach { it.cancel() }
+                    linkUsers.joinAll()
+                    links.release(link)
+                }
             }
         } finally {
             stateJob.cancel()
             withContext(NonCancellable) { connection.close() }
+            // The state collector is gone by now, so say it here: whatever ended the session — a drop, an
+            // error, a rejected key — the BLE link is no longer up.
+            push { it.copy(ble = ConnectionState.DISCONNECTED, rssi = null) }
         }
     }
 

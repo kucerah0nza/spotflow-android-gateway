@@ -24,15 +24,17 @@ import androidx.core.view.updatePadding
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import io.spotflow.ble.DeviceError
 import io.spotflow.ble.GatewayDeviceState
-import io.spotflow.ble.SpotflowGateway
+import io.spotflow.ble.GatewayStatus
+import io.spotflow.ble.ScanState
 import io.spotflow.ble.cloud.BufferUsage
 import io.spotflow.ble.service.SpotflowGatewayService
 import io.spotflow.ble.transport.ConnectionState
 import io.spotflow.gateway.demo.databinding.ActivityMainBinding
 import io.spotflow.gateway.demo.databinding.ItemDeviceBinding
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 /**
@@ -50,6 +52,11 @@ class MainActivity : AppCompatActivity() {
 
     /** Devices whose details the user collapsed (by address); the rest are shown expanded. */
     private val collapsed = mutableSetOf<String>()
+
+    /** What the gateway last reported, kept so each part of the screen can be redrawn from all of it. */
+    private var gatewayStatus = GatewayStatus()
+    private var shownDevices: List<GatewayDeviceState> = emptyList()
+    private var shownUsage: BufferUsage? = null
 
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
         (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
@@ -78,18 +85,17 @@ class MainActivity : AppCompatActivity() {
 
     private val isGatewayRunning: Boolean get() = SpotflowGatewayService.gateway != null
 
-    /** Watches for Bluetooth being toggled while the gateway is running. */
+    /**
+     * Shows the banner while Bluetooth is off and the gateway runs. Only the banner: the gateway watches
+     * the adapter itself and resumes scanning when Bluetooth is back.
+     */
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
-        @android.annotation.SuppressLint("MissingPermission")
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
             when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
                 BluetoothAdapter.STATE_OFF ->
                     if (isGatewayRunning) binding.btBanner.visibility = View.VISIBLE
-                BluetoothAdapter.STATE_ON -> {
-                    binding.btBanner.visibility = View.GONE
-                    if (isGatewayRunning) SpotflowGatewayService.gateway?.startScanning()
-                }
+                BluetoothAdapter.STATE_ON -> binding.btBanner.visibility = View.GONE
             }
         }
     }
@@ -242,6 +248,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showIdle() {
+        gatewayStatus = GatewayStatus()
+        shownUsage = null
         render(emptyList())
         binding.status.text = idleText()
         binding.bufferSummary.isVisible = false
@@ -250,13 +258,17 @@ class MainActivity : AppCompatActivity() {
     /** The gateway-wide buffer line; amber once either tier is over 80% full (eviction is near). */
     private fun renderUsage(usage: BufferUsage) {
         if (!isGatewayRunning) return
+        shownUsage = usage
         val ram = humanBytes(usage.ramBytes)
         val ramMax = limitText(usage.ramMaxBytes)
-        binding.bufferSummary.text = if (usage.flashMaxBytes > 0) {
+        val summary = if (usage.flashMaxBytes > 0) {
             getString(R.string.buffer_summary, ram, ramMax, humanBytes(usage.flashBytes), limitText(usage.flashMaxBytes))
         } else {
             getString(R.string.buffer_summary_ram_only, ram, ramMax)
         }
+        // Without a network nothing is uploaded: say so next to the buffer that is filling up.
+        binding.bufferSummary.text =
+            if (gatewayStatus.online) summary else getString(R.string.buffer_summary_offline, summary)
         val nearlyFull = usage.ramBytes > usage.ramMaxBytes * 0.8 ||
             (usage.flashMaxBytes > 0 && usage.flashBytes > usage.flashMaxBytes * 0.8)
         binding.bufferSummary.setTextColor(
@@ -279,32 +291,60 @@ class MainActivity : AppCompatActivity() {
     private fun observeDevices() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
-                // The service creates a fresh gateway on each Start, so track the current one and
-                // re-subscribe when it changes (otherwise the UI keeps mirroring a shut-down gateway).
-                var current: SpotflowGateway? = null
-                var collectJob: Job? = null
-                while (true) {
-                    val gateway = SpotflowGatewayService.gateway
-                    if (gateway !== current) {
-                        current = gateway
-                        updateSettingsBanner() // a new gateway was built from the saved settings
-                        collectJob?.cancel()
-                        collectJob = gateway?.let { g ->
-                            launch {
-                                launch { g.devices.collect { render(it.values.toList()) } }
-                                launch { g.bufferUsage.collect { renderUsage(it) } }
-                            }
-                        }
+                // The service creates a fresh gateway on each Start and Restart; collectLatest drops the
+                // previous one's flows and follows the new one (otherwise the UI would keep mirroring a
+                // gateway that was shut down).
+                SpotflowGatewayService.gatewayFlow.collectLatest { gateway ->
+                    updateSettingsBanner() // a new gateway was built from the saved settings
+                    if (gateway == null) return@collectLatest
+                    coroutineScope {
+                        launch { gateway.status.collect { renderStatus(it) } }
+                        launch { gateway.devices.collect { render(it.values.toList()) } }
+                        launch { gateway.bufferUsage.collect { renderUsage(it) } }
                     }
-                    delay(300)
                 }
             }
         }
     }
 
+    private fun renderStatus(status: GatewayStatus) {
+        gatewayStatus = status
+        binding.status.text = scanText()
+        renderProblems()
+        shownUsage?.let(::renderUsage)
+    }
+
+    /** What discovery is doing — shown while there are no devices to show instead. */
+    private fun scanText(): String = when (gatewayStatus.scan) {
+        ScanState.SCANNING -> getString(R.string.scanning)
+        ScanState.WAITING_FOR_BLUETOOTH -> getString(R.string.status_bluetooth_off)
+        ScanState.RETRYING -> getString(R.string.status_scan_retrying, gatewayStatus.scanError.orEmpty())
+        ScanState.STOPPED -> getString(R.string.status_starting)
+    }
+
+    /**
+     * The red banner: the first thing that is wrong, most specific first — a device's error, then what
+     * keeps the gateway as a whole from doing its job.
+     */
+    private fun renderProblems() {
+        val deviceError = shownDevices.firstNotNullOfOrNull { it.error }
+        val problem = when {
+            deviceError?.kind == DeviceError.Kind.AUTH_REJECTED ->
+                getString(R.string.problem_with_hint, deviceError.message, getString(R.string.auth_hint))
+            deviceError != null -> getString(R.string.problem, deviceError.message)
+            gatewayStatus.scan == ScanState.RETRYING ->
+                getString(R.string.problem, getString(R.string.status_scan_retrying, gatewayStatus.scanError.orEmpty()))
+            !gatewayStatus.storageAvailable -> getString(R.string.problem, getString(R.string.storage_unavailable))
+            else -> null
+        }
+        binding.errorBanner.text = problem
+        binding.errorBanner.isVisible = problem != null
+    }
+
     private fun render(devices: List<GatewayDeviceState>) {
+        shownDevices = devices
         binding.status.isVisible = devices.isEmpty()
-        binding.status.text = getString(R.string.scanning)
+        binding.status.text = scanText()
 
         // Update the device views in place (so a collapsed device stays collapsed), in the gateway's order.
         val shown = devices.map { it.address }.toSet()
@@ -322,18 +362,7 @@ class MainActivity : AppCompatActivity() {
             showExpanded(item, device.address !in collapsed, animate = false)
         }
 
-        val error = devices.firstNotNullOfOrNull { it.error }
-        if (error == null) {
-            binding.errorBanner.visibility = View.GONE
-        } else {
-            val hint = if (error.contains("ingest key", ignoreCase = true)) {
-                "\n${getString(R.string.auth_hint)}"
-            } else {
-                ""
-            }
-            binding.errorBanner.text = "⚠  $error$hint"
-            binding.errorBanner.visibility = View.VISIBLE
-        }
+        renderProblems()
     }
 
     private fun createDeviceView(address: String): ItemDeviceBinding =

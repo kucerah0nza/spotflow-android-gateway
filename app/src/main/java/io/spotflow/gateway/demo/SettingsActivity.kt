@@ -13,10 +13,12 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.textfield.TextInputLayout
 import io.spotflow.ble.service.SpotflowGatewayService
 import io.spotflow.gateway.demo.databinding.ActivitySettingsBinding
+import java.util.Locale
 
 /**
  * The demo's settings: the ingest key and the store-and-forward buffer sizes. Changes are kept only when
- * the user taps Save; Cancel or Back discards them (asking first if anything was edited). Settings can be
+ * the user taps Save; Cancel discards them, and so does Back, which asks first if anything was edited
+ * (Back is easy to hit by accident; Cancel says what it does). Settings can be
  * changed while the gateway runs — it keeps relaying with the old ones until it is restarted from the main
  * screen, which takes seconds rather than the minutes a Stop/edit/Start round could leave devices waiting.
  */
@@ -44,8 +46,8 @@ class SettingsActivity : AppCompatActivity() {
         // On rotation the fields restore what the user typed; only prefill on first open.
         if (savedInstanceState == null) {
             binding.ingestKey.setText(store.ingestKey)
-            binding.bufferRamMb.setText(store.bufferRamMb.toString())
-            binding.bufferFlashMb.setText(store.bufferFlashMb.toString())
+            binding.bufferRamMb.setText(localized(store.bufferRamMb))
+            binding.bufferFlashMb.setText(localized(store.bufferFlashMb))
         }
         binding.ingestKey.doAfterTextChanged { binding.ingestKeyLayout.error = null }
         binding.bufferRamMb.doAfterTextChanged { binding.bufferRamLayout.error = null }
@@ -76,9 +78,7 @@ class SettingsActivity : AppCompatActivity() {
         binding.ingestKeyLayout.error = if (key.isEmpty()) getString(R.string.ingest_key_required) else null
         if (ramMb == null || flashMb == null || key.isEmpty()) return
 
-        store.ingestKey = key
-        store.bufferRamMb = ramMb
-        store.bufferFlashMb = flashMb
+        store.save(key, ramMb, flashMb)
         Toast.makeText(this, R.string.settings_saved, Toast.LENGTH_SHORT).show()
         finish()
     }
@@ -90,12 +90,15 @@ class SettingsActivity : AppCompatActivity() {
         return value
     }
 
+    /** A number as the user's locale writes it; [megabytes] reads any locale's digits back. */
+    private fun localized(number: Int): String = String.format(Locale.getDefault(), "%d", number)
+
     private fun ingestKeyInput(): String = binding.ingestKey.text?.toString()?.trim().orEmpty()
 
     private fun hasChanges(): Boolean =
         ingestKeyInput() != store.ingestKey.orEmpty() ||
-            binding.bufferRamMb.text?.toString()?.trim() != store.bufferRamMb.toString() ||
-            binding.bufferFlashMb.text?.toString()?.trim() != store.bufferFlashMb.toString()
+            binding.bufferRamMb.text?.toString()?.trim()?.toIntOrNull() != store.bufferRamMb ||
+            binding.bufferFlashMb.text?.toString()?.trim()?.toIntOrNull() != store.bufferFlashMb
 
     private fun confirmDiscard() {
         MaterialAlertDialogBuilder(this)

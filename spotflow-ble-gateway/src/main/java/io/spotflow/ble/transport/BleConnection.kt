@@ -5,11 +5,11 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 
 /** Lifecycle state of a single BLE connection to a Spotflow device. */
-enum class ConnectionState {
-    /** Not connected (initial state, or after [BleConnection.close]). */
+public enum class ConnectionState {
+    /** Not connected (initial state, or after the session ended). */
     DISCONNECTED,
 
-    /** GATT link is being established (managed mode only). */
+    /** GATT link is being established. */
     CONNECTING,
 
     /** Discovering services / negotiating MTU / reading characteristics. */
@@ -18,7 +18,7 @@ enum class ConnectionState {
     /** Ready: notifications enabled, characteristics resolved, messages flowing. */
     READY,
 
-    /** Terminal failure for this attempt; a managed connection may retry. */
+    /** Terminal failure for this attempt; a managed connection is retried. */
     FAILED,
 }
 
@@ -30,7 +30,7 @@ enum class ConnectionState {
  * All suspend functions serialize onto the single GATT operation queue; only one GATT operation is ever
  * outstanding at a time.
  */
-interface BleConnection {
+internal interface BleConnection {
 
     /** Bluetooth MAC address of the device. */
     val deviceAddress: String
@@ -71,7 +71,8 @@ interface BleConnection {
 
     /**
      * Releases the transport. A managed connection disconnects and closes the GATT; an attached
-     * connection only stops using it and leaves the host to own disconnection.
+     * connection turns the device's TX stream off, stops using the GATT and leaves the host to own
+     * disconnection. Call from a non-cancellable context.
      */
     suspend fun close()
 }

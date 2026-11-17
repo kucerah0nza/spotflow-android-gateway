@@ -22,7 +22,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
-    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+    <!-- Declared, but not required: a library must not decide which devices its host app is offered to.
+         An app that is useless without BLE sets required="true" in its own manifest. -->
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
 
     <application>
         <service

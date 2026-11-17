@@ -25,7 +25,9 @@ class MessageStoreTest {
     private fun put(device: String, marker: Int, size: Int) =
         store.enqueueAll(device, listOf(MessageStore.Entry(marker.toLong(), "t", payload(marker, size))))
 
-    private fun open(maxBytes: Long) = MessageStore(context, maxBytes).also { store = it }
+    /** Sizes are payload bytes only unless a test asks for the per-row overhead. */
+    private fun open(maxBytes: Long, rowOverhead: Long = 0) =
+        MessageStore(context, maxBytes, rowOverhead).also { store = it }
 
     @Before
     fun setUp() {
@@ -147,6 +149,85 @@ class MessageStoreTest {
         assertNull(store.peek("a"))
         assertEquals(0L, store.bytes)
         assertTrue(store.storedDeviceIds().isEmpty())
+    }
+
+    @Test
+    fun `creating the store does no disk I-O, the database opens on first use`() {
+        open(maxBytes = 10_000)
+        val file = context.getDatabasePath("spotflow_buffer.db")
+        assertFalse("not opened by the constructor (it may run on the main thread)", file.exists())
+        assertEquals("the total reads 0 without opening", 0L, store.bytes)
+        assertFalse(file.exists())
+
+        store.open()
+        assertTrue(file.exists())
+        assertTrue(store.available.value)
+    }
+
+    @Test
+    fun `a database that cannot be opened makes the store unavailable instead of throwing`() {
+        context.getDatabasePath("spotflow_buffer.db").mkdirs() // a directory in the file's place
+        open(maxBytes = 10_000)
+
+        assertNull("writes are refused", put("a", 1, 10))
+        assertFalse(store.available.value)
+        assertTrue(store.storedDeviceIds().isEmpty())
+        assertNull(store.peek("a"))
+        assertEquals("sequence numbers still work, for the RAM tier", listOf(1L, 2L), listOf(store.nextSeq("a"), store.nextSeq("a")))
+    }
+
+    @Test
+    fun `a batch is read in order and removed in one go`() {
+        open(maxBytes = 10_000)
+        put("a", 1, 10); put("a", 2, 10); put("a", 3, 10); put("b", 4, 10)
+
+        assertEquals(listOf(1L, 2L), store.peekBatch("a", maxRows = 2, maxPayloadBytes = 1_000).map { it.seq })
+        assertEquals("the payload limit ends the batch early", 2, store.peekBatch("a", maxRows = 10, maxPayloadBytes = 25).size)
+        assertEquals("but never below one row", 1, store.peekBatch("a", maxRows = 10, maxPayloadBytes = 1).size)
+
+        store.removeAll("a", listOf(1, 2, 99)) // 99 is not stored: skipped
+        assertEquals(3L, store.peek("a")!!.seq)
+        assertEquals(10L, store.bytes("a"))
+        assertEquals("other devices are untouched", 10L, store.bytes("b"))
+    }
+
+    @Test
+    fun `sizes include the per-row overhead, also after reopening`() {
+        open(maxBytes = 10_000, rowOverhead = 20)
+        put("a", 1, 5); put("a", 2, 5)
+        assertEquals(50L, store.bytes("a"))
+        store.remove("a", 1)
+        assertEquals(25L, store.bytes)
+        store.close()
+
+        open(maxBytes = 10_000, rowOverhead = 20)
+        assertEquals(25L, store.bytes("a"))
+    }
+
+    @Test
+    fun `the limit counts the overhead too`() {
+        open(maxBytes = 100, rowOverhead = 30)
+        put("a", 1, 10); put("a", 2, 10) // 80
+        val evicted = put("a", 3, 10) // 120 > 100
+        assertEquals(setOf("a"), evicted)
+        assertEquals(2L, store.peek("a")!!.seq)
+    }
+
+    @Test
+    fun `a gateway without a flash tier does not shrink the limit of the one still writing`() {
+        val shared = MessageStore.acquire(context, maxBytes = 10_000) // the running gateway
+        store = shared
+        shared.enqueueAll("a", listOf(MessageStore.Entry(1, "t", payload(1, 100))))
+
+        // Restarted in place with flash set to 0: the new gateway shares the store.
+        assertTrue(MessageStore.acquire(context, maxBytes = 0) === shared)
+        // The old gateway now writes its RAM out. Under a limit of 0 this would evict all but one row.
+        val evicted = shared.enqueueAll("a", listOf(MessageStore.Entry(2, "t", payload(2, 100))))
+
+        assertTrue(evicted!!.isEmpty())
+        assertEquals("the backlog is kept for the new gateway to deliver", 2L, shared.count("a"))
+        MessageStore.release(shared)
+        MessageStore.release(shared)
     }
 
     private fun legacyFile(name: String, deviceIdInMeta: String?, rows: List<Pair<Long, Int>>) {

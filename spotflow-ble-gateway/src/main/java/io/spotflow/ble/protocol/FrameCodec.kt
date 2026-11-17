@@ -15,12 +15,11 @@ import java.io.ByteArrayOutputStream
  * ```
  *
  * All fragments of one message share the same `type` and `seq`; `seq` increments per message and is
- * how the [Reassembler] groups fragments. Flags mark the first and last fragment.
- *
- * NOTE: the exact numeric flag bit values below are not published in the Spotflow docs and must be
- * verified against the Device SDK before interop testing.
+ * how the [Reassembler] groups fragments. Flags mark the first and last fragment; those two have been
+ * exercised against the Device SDK on real hardware. [FLAG_NEEDS_ACK] is part of the protocol but the
+ * gateway neither sets nor honours it (see [MessageType]).
  */
-object FrameCodec {
+internal object FrameCodec {
 
     /** Flag bits carried in byte [1] of every frame. */
     const val FLAG_IS_FIRST = 0x01

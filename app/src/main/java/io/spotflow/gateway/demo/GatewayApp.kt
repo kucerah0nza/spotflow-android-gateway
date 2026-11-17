@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
+import io.spotflow.ble.DeviceFilter
 import io.spotflow.ble.SpotflowGateway
 import io.spotflow.ble.cloud.MqttConfig
 import io.spotflow.ble.cloud.StaticIngestKey
@@ -39,11 +40,18 @@ fun configureGatewayService(store: IngestKeyStore): Boolean {
         val ramBytes = store.bufferRamMb.toLong() * 1024L * 1024L
         val flashBytes = store.bufferFlashMb.toLong() * 1024L * 1024L
         val config = MqttConfig(bufferMaxBytes = ramBytes + flashBytes, ramBufferMaxBytes = ramBytes)
-        store.appliedSettings = store.settingsFingerprint
-        SpotflowGateway(ctx, StaticIngestKey(key), config)
+        store.appliedSettingsVersion = store.settingsVersion
+        // A demo relays whatever is in range. An app for real devices passes a filter that accepts only
+        // its own (see DeviceFilter): the BLE protocol does not authenticate devices.
+        SpotflowGateway(ctx, StaticIngestKey(key), DeviceFilter.AcceptAll, config)
     }
     SpotflowGatewayService.onReady = { gateway ->
-        runCatching { gateway.startScanning() } // SecurityException if BLE permissions were revoked
+        try {
+            gateway.startScanning()
+        } catch (e: SecurityException) {
+            // The Bluetooth permissions were revoked since the gateway was started.
+            Log.w("GatewayApp", "cannot scan: ${e.message}")
+        }
     }
     return true
 }

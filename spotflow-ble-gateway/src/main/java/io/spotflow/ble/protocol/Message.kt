@@ -4,7 +4,7 @@ package io.spotflow.ble.protocol
  * A fully reassembled Spotflow BLE message. The [payload] is relayed opaquely (CBOR) to/from the
  * Spotflow cloud; this library does not parse it.
  */
-class Message(
+internal class Message(
     val type: MessageType,
     val payload: ByteArray,
 ) {

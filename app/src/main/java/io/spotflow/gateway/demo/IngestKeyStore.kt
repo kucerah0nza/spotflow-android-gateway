@@ -6,8 +6,8 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import android.util.Log
+import androidx.core.content.edit
 import java.security.KeyStore
-import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -26,55 +26,62 @@ class IngestKeyStore(context: Context) {
     private val prefs: SharedPreferences = context.getSharedPreferences("spotflow_prefs", Context.MODE_PRIVATE)
 
     init {
-        // Remove what earlier versions stored: a plain-text fallback copy of the key, and the
+        // Remove what earlier versions stored: a plain-text fallback copy of the key, a fingerprint
+        // derived from it (a hash of a secret has no business sitting in plain preferences), and the
         // EncryptedSharedPreferences file (security-crypto is deprecated and no longer used).
-        if (prefs.contains(LEGACY_KEY_INGEST)) prefs.edit().remove(LEGACY_KEY_INGEST).apply()
+        if (prefs.contains(LEGACY_KEY_INGEST) || prefs.contains(LEGACY_KEY_APPLIED)) {
+            prefs.edit { remove(LEGACY_KEY_INGEST).remove(LEGACY_KEY_APPLIED) }
+        }
         context.deleteSharedPreferences(LEGACY_SECURE_PREFS)
     }
 
     var ingestKey: String?
         get() = prefs.getString(KEY_INGEST, null)?.let { decrypt(it) }
-        set(value) {
+        private set(value) {
             val encrypted = value?.takeIf { it.isNotBlank() }?.let { encrypt(it) }
-            prefs.edit().apply {
+            prefs.edit {
                 if (encrypted == null) remove(KEY_INGEST) else putString(KEY_INGEST, encrypted)
-            }.apply()
+            }
         }
 
     /** RAM (in-memory) buffer tier size in megabytes (default 1; 0 = spill to flash immediately). */
     var bufferRamMb: Int
         get() = prefs.getInt(KEY_BUFFER_RAM_MB, DEFAULT_BUFFER_RAM_MB)
-        set(value) = prefs.edit().putInt(KEY_BUFFER_RAM_MB, value.coerceAtLeast(0)).apply()
+        private set(value) = prefs.edit { putInt(KEY_BUFFER_RAM_MB, value.coerceAtLeast(0)) }
 
     /** Flash (persistent) buffer tier size in megabytes (default 50; 0 = RAM-only, never writes flash). */
     var bufferFlashMb: Int
         get() = prefs.getInt(KEY_BUFFER_FLASH_MB, DEFAULT_BUFFER_FLASH_MB)
-        set(value) = prefs.edit().putInt(KEY_BUFFER_FLASH_MB, value.coerceAtLeast(0)).apply()
+        private set(value) = prefs.edit { putInt(KEY_BUFFER_FLASH_MB, value.coerceAtLeast(0)) }
 
     /** Whether the user left the gateway running (so it is restored after the process is restarted). */
     var gatewayEnabled: Boolean
         get() = prefs.getBoolean(KEY_ENABLED, false)
-        set(value) = prefs.edit().putBoolean(KEY_ENABLED, value).apply()
+        set(value) = prefs.edit { putBoolean(KEY_ENABLED, value) }
 
     /**
-     * Identifies the saved settings without revealing the key (it is hashed), so they can be compared
-     * with [appliedSettings].
+     * Saves the settings together. If anything changed, [settingsVersion] moves on, so a gateway built
+     * from the previous ones can be told apart ([hasUnappliedSettings]).
      */
-    val settingsFingerprint: String
-        get() {
-            val keyHash = MessageDigest.getInstance("SHA-256")
-                .digest(ingestKey.orEmpty().toByteArray(Charsets.UTF_8))
-                .joinToString("") { "%02x".format(it) }
-            return "$keyHash|$bufferRamMb|$bufferFlashMb"
-        }
+    fun save(ingestKey: String, bufferRamMb: Int, bufferFlashMb: Int) {
+        val changed = ingestKey != this.ingestKey.orEmpty() ||
+            bufferRamMb != this.bufferRamMb || bufferFlashMb != this.bufferFlashMb
+        this.ingestKey = ingestKey
+        this.bufferRamMb = bufferRamMb
+        this.bufferFlashMb = bufferFlashMb
+        if (changed) prefs.edit { putInt(KEY_SETTINGS_VERSION, settingsVersion + 1) }
+    }
 
-    /** [settingsFingerprint] of the settings the running gateway was started with. */
-    var appliedSettings: String?
-        get() = prefs.getString(KEY_APPLIED, null)
-        set(value) = prefs.edit().putString(KEY_APPLIED, value).apply()
+    /** Counts the changes to the saved settings. Says nothing about what they are. */
+    val settingsVersion: Int get() = prefs.getInt(KEY_SETTINGS_VERSION, 0)
+
+    /** [settingsVersion] of the settings the running gateway was built from. */
+    var appliedSettingsVersion: Int
+        get() = prefs.getInt(KEY_APPLIED_VERSION, 0)
+        set(value) = prefs.edit { putInt(KEY_APPLIED_VERSION, value) }
 
     /** Whether saved settings differ from those the running gateway uses (it must restart to apply them). */
-    val hasUnappliedSettings: Boolean get() = appliedSettings != settingsFingerprint
+    val hasUnappliedSettings: Boolean get() = appliedSettingsVersion != settingsVersion
 
     private fun encrypt(plain: String): String? = runCatching {
         val cipher = Cipher.getInstance(TRANSFORMATION).apply { init(Cipher.ENCRYPT_MODE, secretKey()) }
@@ -116,8 +123,10 @@ class IngestKeyStore(context: Context) {
         const val KEY_BUFFER_FLASH_MB = "buffer_flash_mb"
         const val DEFAULT_BUFFER_FLASH_MB = 50
         const val KEY_ENABLED = "gateway_enabled"
-        const val KEY_APPLIED = "applied_settings"
+        const val KEY_SETTINGS_VERSION = "settings_version"
+        const val KEY_APPLIED_VERSION = "applied_settings_version"
         const val LEGACY_KEY_INGEST = "ingest_key"
+        const val LEGACY_KEY_APPLIED = "applied_settings"
         const val LEGACY_SECURE_PREFS = "spotflow_secure_prefs"
     }
 }

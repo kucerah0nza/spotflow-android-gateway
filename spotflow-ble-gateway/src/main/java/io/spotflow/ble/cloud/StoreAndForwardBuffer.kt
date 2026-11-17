@@ -1,12 +1,15 @@
 package io.spotflow.ble.cloud
 
-import android.util.Log
+import io.spotflow.ble.Slog
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.io.Closeable
 
-/** How much of the gateway-wide store-and-forward budget is in use, across all devices. */
-data class BufferUsage(
+/**
+ * How much of the gateway-wide store-and-forward budget is in use, across all devices. Sizes count each
+ * message's payload plus a fixed estimate of the overhead of holding it.
+ */
+public data class BufferUsage(
     val ramBytes: Long = 0,
     val ramMaxBytes: Long = 0,
     val flashBytes: Long = 0,
@@ -31,7 +34,8 @@ data class BufferUsage(
  *
  * With no flash budget ([flashMaxBytes] 0) the pool is RAM-only: when RAM is full the oldest message of the
  * device holding the most RAM is dropped, and nothing is written to flash. The [store] is still read, so
- * data left on flash by an earlier run is delivered.
+ * data left on flash by an earlier run is delivered. The same happens, whatever the budget, while the
+ * store is unusable (e.g. storage is full).
  *
  * All buffers share this pool's [lock]. [release] is called once, after [shutdown], when the last buffer
  * has closed.
@@ -40,6 +44,8 @@ internal class BufferPool(
     private val store: MessageStore,
     private val ramMaxBytes: Long,
     private val flashMaxBytes: Long,
+    /** What a message in RAM is counted as beyond its payload (object headers, queue slot). */
+    internal val itemOverheadBytes: Long = ITEM_OVERHEAD_BYTES,
     private val release: () -> Unit = {},
 ) {
     internal val spillToFlash: Boolean = flashMaxBytes > 0
@@ -61,13 +67,26 @@ internal class BufferPool(
     /** Live usage of the budget, updated on every change. */
     val usage: StateFlow<BufferUsage> = _usage
 
+    /** False once the flash store turned out to be unusable (the pool then drops instead of spilling). */
+    val storeAvailable: StateFlow<Boolean> get() = store.available
+
+    /** See [MessageStore.handoffs]. */
+    val handoffs: StateFlow<Int> get() = store.handoffs
+
     /** Must hold [lock]. Publishes the current [usage]. */
     internal fun publishUsage() {
         _usage.value = BufferUsage(ramUsed, ramMaxBytes, store.bytes, flashMaxBytes)
     }
 
-    /** Devices with data in flash, e.g. left behind when the app was killed during an outage. */
-    fun storedDeviceIds(): List<String> = store.storedDeviceIds()
+    /**
+     * Devices with data in flash, e.g. left behind when the app was killed during an outage. Opens the
+     * store if it isn't yet, so call it from a background thread.
+     */
+    fun storedDeviceIds(): List<String> {
+        val ids = store.storedDeviceIds()
+        synchronized(lock) { publishUsage() } // the store's totals are known from here on
+        return ids
+    }
 
     /** Opens a buffer for [deviceId]; it first delivers anything the device already has stored. */
     fun open(deviceId: String): StoreAndForwardBuffer = synchronized(lock) {
@@ -104,7 +123,7 @@ internal class BufferPool(
                     dropUntilWithin(ramMaxBytes, changed)
                     break
                 }
-                changed += buffersOf(evicted)
+                changed += flashEvicted(evicted)
             }
         } else {
             dropUntilWithin(ramMaxBytes, changed)
@@ -112,13 +131,21 @@ internal class BufferPool(
         return changed
     }
 
-    /** Must hold [lock]. Returns the buffers of [deviceIds] (devices that lost data to flash eviction). */
-    internal fun buffersOf(deviceIds: Set<String>): List<StoreAndForwardBuffer> =
-        if (deviceIds.isEmpty()) emptyList() else buffers.filter { it.deviceId in deviceIds }
+    /**
+     * Must hold [lock]. Tells the buffers of [deviceIds] — devices that lost data to flash eviction — and
+     * returns them.
+     */
+    internal fun flashEvicted(deviceIds: Set<String>): List<StoreAndForwardBuffer> {
+        if (deviceIds.isEmpty()) return emptyList()
+        return buffers.filter { it.deviceId in deviceIds }.onEach { it.onFlashEvicted() }
+    }
 
     /** Must hold [lock]. */
     internal fun closed(buffer: StoreAndForwardBuffer) {
         buffers -= buffer
+        // After a shutdown nothing here uploads what this buffer just left on flash: let a gateway that
+        // is running (a restarted one overlaps with this one) know there is data to pick up.
+        if (shutDown) store.handedOver()
         releaseIfIdle()
     }
 
@@ -140,19 +167,32 @@ internal class BufferPool(
             release()
         }
     }
+
+    companion object {
+        /**
+         * What a message in RAM is counted as beyond its payload: the item and array headers, the topic
+         * reference and its slot in the queue. An estimate that keeps the limit honest for tiny messages.
+         */
+        const val ITEM_OVERHEAD_BYTES = 64L
+    }
 }
 
 /**
  * One device's store-and-forward buffer: a RAM queue in front of the device's part of the shared flash
  * [store], within the budgets of its [pool] (see [BufferPool] for when data moves to flash or is evicted).
  *
- * Every item gets a monotonic, per-device sequence number (from the [store]) that follows it across tiers, so FIFO order is
- * preserved (the flash tier always holds strictly lower sequence numbers than RAM and is drained first)
- * and a published item can be removed exactly, even if it was spilled to flash mid-publish. Data still in
- * RAM is lost if the process is killed — an accepted trade-off.
+ * Every item gets a monotonic, per-device sequence number (from the [store]) that follows it across tiers,
+ * so FIFO order is preserved (the flash tier always holds strictly lower sequence numbers than RAM and is
+ * drained first) and a published item can be removed exactly, even if it was spilled to flash mid-publish.
+ * Data still in RAM is lost if the process is killed — an accepted trade-off.
  *
- * Single-producer ([enqueue]) / single-consumer ([takeNext] then [remove]). [takeNext] only *peeks*, so a
- * failed publish needs no bookkeeping and there is neither reordering nor duplication.
+ * Single-producer ([enqueue]) / single-consumer ([peek] then [remove]). [peek] does not take anything out,
+ * so a failed publish needs no bookkeeping and there is neither reordering nor duplication.
+ *
+ * Flash is read and cleared in batches: the oldest rows are *staged* — read into memory with one query —
+ * and deleted with one transaction once all of them have been published, rather than a query and a
+ * transaction per message. If the process dies in between, the published part of a batch is uploaded
+ * again on the next run (delivery is at-least-once anyway).
  */
 internal class StoreAndForwardBuffer internal constructor(
     private val pool: BufferPool,
@@ -171,6 +211,15 @@ internal class StoreAndForwardBuffer internal constructor(
 
     private val ram = ArrayDeque<Item>()
 
+    /** The oldest flash rows not yet published, read ahead in one query. */
+    private val staged = ArrayDeque<Item>()
+
+    /** Staged rows that have been published; deleted together once the staged batch is through. */
+    private val published = ArrayList<Long>()
+    private var publishedBytes = 0L
+
+    private var closed = false
+
     /** Must hold the pool lock. */
     internal var ramTierBytes = 0L
         private set
@@ -182,49 +231,80 @@ internal class StoreAndForwardBuffer internal constructor(
     val ramBytes: Long get() = synchronized(pool.lock) { ramTierBytes }
 
     /** Bytes of this device held in flash. */
-    val diskBytes: Long get() = store.bytes(deviceId)
+    val diskBytes: Long get() = synchronized(pool.lock) { flashBytes() }
 
     /** Total bytes of this device across both tiers. */
-    val bytes: Long get() = synchronized(pool.lock) { ramTierBytes + store.bytes(deviceId) }
+    val bytes: Long get() = synchronized(pool.lock) { ramTierBytes + flashBytes() }
 
     /** Messages of this device waiting to be uploaded, across both tiers. */
-    val count: Long get() = synchronized(pool.lock) { ram.size + store.count(deviceId) }
+    val count: Long get() = synchronized(pool.lock) { ram.size + flashRows() }
 
     /** Whether nothing of this device is buffered. */
-    val isEmpty: Boolean get() = synchronized(pool.lock) { ram.isEmpty() && store.isEmpty(deviceId) }
+    val isEmpty: Boolean get() = synchronized(pool.lock) { ram.isEmpty() && flashRows() == 0L }
 
     /** Appends a message to RAM; the pool then spills or drops as needed to stay within its budget. */
     fun enqueue(topic: String, payload: ByteArray) {
         val changed = synchronized(pool.lock) {
-            ram.addLast(Item(store.nextSeq(deviceId), topic, payload))
-            ramTierBytes += payload.size
-            pool.ramChanged(payload.size.toLong())
+            if (closed) {
+                // Its owner is gone (the cloud link was closed): nothing would ever upload this.
+                Slog.w(TAG, "dropping a message for $deviceId that arrived after its buffer was closed")
+                return
+            }
+            val item = Item(store.nextSeq(deviceId), topic, payload)
+            ram.addLast(item)
+            ramTierBytes += cost(item)
+            pool.ramChanged(cost(item))
             pool.enforceRamBudget().also { pool.publishUsage() }
         }
         notify(changed)
     }
 
     /**
-     * Returns the oldest item to publish (flash first, for FIFO), or null if empty. The item is only
-     * peeked — finalize with [remove] after a successful publish; a failed publish needs no action.
+     * Returns the oldest items to publish, in order, without taking them out: up to [maxItems], stopping
+     * early once their payloads exceed [maxPayloadBytes] (but always at least one, if any). Finalize each
+     * with [remove] once it is published; a failed publish needs no action.
+     *
+     * Flash comes first, for FIFO: RAM only follows once nothing is left in flash beyond what is returned.
      * The flash check uses in-memory counters, so the common empty-flash path never queries SQLite.
      */
-    fun takeNext(): Item? = synchronized(pool.lock) {
-        if (!store.isEmpty(deviceId)) {
-            store.peek(deviceId)?.let { return Item(it.seq, it.topic, it.payload) }
+    fun peek(maxItems: Int = 1, maxPayloadBytes: Long = Long.MAX_VALUE): List<Item> = synchronized(pool.lock) {
+        if (staged.isEmpty() && flashRows() > 0) stageFromFlash()
+        val items = ArrayList<Item>(minOf(maxItems, staged.size + ram.size))
+        var payloadBytes = 0L
+        fun take(item: Item): Boolean {
+            if (items.size >= maxItems) return false
+            if (items.isNotEmpty() && payloadBytes + item.payload.size > maxPayloadBytes) return false
+            items += item
+            payloadBytes += item.payload.size
+            return true
         }
-        ram.firstOrNull()
+        for (item in staged) if (!take(item)) return items
+        if (flashRows() > staged.size) return items // older messages are still in flash, unstaged
+        for (item in ram) if (!take(item)) return items
+        items
     }
+
+    /** The oldest item to publish, or null if empty; see [peek]. */
+    fun takeNext(): Item? = peek(1).firstOrNull()
 
     /** Removes a published (or intentionally dropped) item, from whichever tier holds it. */
     fun remove(item: Item): Unit = synchronized(pool.lock) {
-        val head = ram.firstOrNull()
-        if (head != null && head.seq == item.seq) {
-            ram.removeFirst()
-            ramTierBytes -= head.payload.size
-            pool.ramChanged(-head.payload.size.toLong())
+        val stagedIndex = staged.indexOfFirst { it.seq == item.seq }
+        if (stagedIndex >= 0) {
+            staged.removeAt(stagedIndex)
+            published += item.seq
+            publishedBytes += store.costOf(item.payload.size)
+            if (staged.isEmpty()) commitPublished()
         } else {
-            store.remove(deviceId, item.seq) // the item was spilled (possibly mid-publish) or evicted
+            // Only the head of RAM is ever handed out, so the item is near the front if it is there at all.
+            val ramIndex = ram.asSequence().take(RAM_SEARCH_DEPTH).indexOfFirst { it.seq == item.seq }
+            if (ramIndex >= 0) {
+                val removed = ram.removeAt(ramIndex)
+                ramTierBytes -= cost(removed)
+                pool.ramChanged(-cost(removed))
+            } else {
+                store.remove(deviceId, item.seq) // the item was spilled (possibly mid-publish) or evicted
+            }
         }
         pool.publishUsage()
     }
@@ -235,16 +315,21 @@ internal class StoreAndForwardBuffer internal constructor(
      */
     fun flushToDisk() {
         val changed = synchronized(pool.lock) {
+            commitPublished()
             if (ram.isEmpty() || !pool.spillToFlash) return
             val evicted = spillOldest(Long.MAX_VALUE) ?: return
             pool.publishUsage()
-            pool.buffersOf(evicted).toSet() - this
+            pool.flashEvicted(evicted).toSet() - this
         }
         notify(changed)
     }
 
     /** Leaves the pool. Anything still in RAM is discarded, so call [flushToDisk] first to keep it. */
     override fun close(): Unit = synchronized(pool.lock) {
+        if (closed) return
+        closed = true
+        commitPublished()
+        staged.clear()
         pool.ramChanged(-ramTierBytes)
         ram.clear()
         ramTierBytes = 0
@@ -262,7 +347,7 @@ internal class StoreAndForwardBuffer internal constructor(
         for (item in ram) {
             if (batchBytes >= bytes && batch.isNotEmpty()) break
             batch += item
-            batchBytes += item.payload.size
+            batchBytes += cost(item)
         }
         val evicted = store.enqueueAll(deviceId, batch.map { MessageStore.Entry(it.seq, it.topic, it.payload) })
             ?: return null
@@ -275,10 +360,39 @@ internal class StoreAndForwardBuffer internal constructor(
     /** Must hold the pool lock. */
     internal fun dropOldestRam() {
         val dropped = ram.removeFirst()
-        ramTierBytes -= dropped.payload.size
-        pool.ramChanged(-dropped.payload.size.toLong())
-        Log.w(TAG, "buffer full; dropped oldest message of $deviceId (${dropped.payload.size} bytes)")
+        ramTierBytes -= cost(dropped)
+        pool.ramChanged(-cost(dropped))
+        Slog.w(TAG, "buffer full; dropped oldest message of $deviceId (${dropped.payload.size} bytes)")
     }
+
+    /**
+     * Must hold the pool lock. The store evicted some of this device's oldest rows — which are the staged
+     * ones. Forget the read-ahead so the next [peek] starts from what flash holds now; an evicted item
+     * that is being published at this moment still completes ([remove] finds nothing left to delete).
+     */
+    internal fun onFlashEvicted() {
+        commitPublished()
+        staged.clear()
+    }
+
+    private fun stageFromFlash() {
+        store.peekBatch(deviceId, STAGE_ROWS, STAGE_PAYLOAD_BYTES).mapTo(staged) { Item(it.seq, it.topic, it.payload) }
+    }
+
+    /** Deletes the published part of the staged batch from flash, in one transaction. */
+    private fun commitPublished() {
+        if (published.isEmpty()) return
+        store.removeAll(deviceId, published)
+        published.clear()
+        publishedBytes = 0
+    }
+
+    /** Rows of this device in flash that still have to be published. */
+    private fun flashRows(): Long = (store.count(deviceId) - published.size).coerceAtLeast(0)
+
+    private fun flashBytes(): Long = (store.bytes(deviceId) - publishedBytes).coerceAtLeast(0)
+
+    private fun cost(item: Item): Long = item.payload.size + pool.itemOverheadBytes
 
     private fun notify(changed: Collection<StoreAndForwardBuffer>) {
         for (buffer in changed) if (buffer !== this) buffer.onExternalChange?.invoke()
@@ -286,5 +400,12 @@ internal class StoreAndForwardBuffer internal constructor(
 
     private companion object {
         const val TAG = "SpotflowBuffer"
+
+        /** How much of flash is read ahead, and so deleted, at a time. */
+        const val STAGE_ROWS = 64
+        const val STAGE_PAYLOAD_BYTES = 256L * 1024
+
+        /** How far into RAM [remove] looks for an item; far more than is ever handed out at once. */
+        const val RAM_SEARCH_DEPTH = 256
     }
 }

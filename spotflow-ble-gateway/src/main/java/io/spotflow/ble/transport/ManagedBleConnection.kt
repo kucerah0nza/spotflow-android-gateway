@@ -5,6 +5,7 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import io.spotflow.ble.protocol.GattProfile
+import io.spotflow.ble.protocol.Message
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withTimeoutOrNull
@@ -15,7 +16,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  *
  * Discovery of the [device] (scanning for [GattProfile.SERVICE]) is handled by [SpotflowScanner].
  */
-class ManagedBleConnection(
+internal class ManagedBleConnection(
     context: Context,
     private val device: BluetoothDevice,
     requestedMtu: Int = SpotflowGattSession.MAX_MTU,
@@ -39,7 +40,7 @@ class ManagedBleConnection(
 
     override val deviceAddress: String get() = device.address
     override val state: StateFlow<ConnectionState> get() = session.state
-    override val incoming: Flow<io.spotflow.ble.protocol.Message> get() = session.incoming
+    override val incoming: Flow<Message> get() = session.incoming
     override val mtu: Int get() = session.mtu
 
     // The host is responsible for holding BLUETOOTH_CONNECT (documented in the README/manifest).
@@ -88,4 +89,4 @@ class ManagedBleConnection(
 }
 
 /** A managed device did not reappear within its auto-connect timeout. */
-class DeviceUnreachableException(message: String) : Exception(message)
+internal class DeviceUnreachableException(message: String) : Exception(message)
