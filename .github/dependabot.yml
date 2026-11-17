@@ -1,0 +1,35 @@
+# Keeps the build's dependencies and the workflows' pinned actions current, one reviewable pull request at
+# a time — rather than a rare, large upgrade that is hard to pin a regression on.
+version: 2
+updates:
+  - package-ecosystem: gradle
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    ignore:
+      # The library's own dependency: newer versions force every app that uses the library onto a newer
+      # compileSdk (see gradle/libs.versions.toml). Raise it deliberately, not by routine.
+      - dependency-name: "androidx.core:core-ktx"
+      # AGP 9 (with Gradle 9) builds the project, but the Robolectric tests then fail to start on JDK 17
+      # (InvalidJarIndexError while looking up package properties). Needs a proper migration, not a bump.
+      - dependency-name: "com.android.application"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "com.android.library"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "gradle"
+        update-types: ["version-update:semver-major"]
+    groups:
+      # These are released together and are best moved together.
+      kotlin:
+        patterns:
+          - "org.jetbrains.kotlin*"
+      androidx:
+        patterns:
+          - "androidx.*"
+          - "com.google.android.material*"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
