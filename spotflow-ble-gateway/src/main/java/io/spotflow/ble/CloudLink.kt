@@ -80,6 +80,17 @@ internal class CloudLink(
      */
     private var lastWrittenDesired: ByteArray? = null
 
+    // Session metadata (build ID, run ID, ...) gives the cloud the context of the device's telemetry, but
+    // only for the MQTT connection it was published on: after a reconnect it must be published again
+    // before anything else. These track which one applies, in buffer order. Guarded by [metadataLock].
+    private val metadataLock = Any()
+
+    /** Sequence numbers of session-metadata messages in the buffer (enqueued by this link). */
+    private val metadataSeqs = LinkedHashSet<Long>()
+
+    /** The session metadata published last, which applies to the messages buffered after it. */
+    private var currentMetadata: StoreAndForwardBuffer.Item? = null
+
     init {
         // Another device's data can push this device's out of RAM (to flash) or out of flash (evicted).
         buffer.onExternalChange = { pushBuffer() }
@@ -119,6 +130,30 @@ internal class CloudLink(
         drainSignal.trySend(Unit)
     }
 
+    /**
+     * Buffers a BLE session's session metadata like [enqueue], and remembers it as such: once published,
+     * it is published again, ahead of the rest of the buffer, whenever the MQTT connection is re-established.
+     */
+    fun enqueueSessionMetadata(topic: String, payload: ByteArray) {
+        // Under the lock, so the drain loop can't publish it before it is known to be session metadata.
+        synchronized(metadataLock) {
+            val seq = buffer.enqueue(topic, payload) ?: return
+            metadataSeqs += seq
+            // Only one that was evicted from a full buffer is ever left here; don't let those add up.
+            if (metadataSeqs.size > MAX_TRACKED_METADATA) metadataSeqs.remove(metadataSeqs.first())
+        }
+        pushBuffer()
+        drainSignal.trySend(Unit)
+    }
+
+    /** Takes [item] out of the buffer, published or given up on. */
+    private fun removeFromBuffer(item: StoreAndForwardBuffer.Item, published: Boolean) {
+        buffer.remove(item)
+        synchronized(metadataLock) {
+            if (metadataSeqs.remove(item.seq) && published) currentMetadata = item
+        }
+    }
+
     /** What became of one publish. */
     private sealed interface Outcome {
         data object Delivered : Outcome
@@ -152,6 +187,9 @@ internal class CloudLink(
         var window = MAX_WINDOW
         var failingSeq = -1L
         var failures = 0
+        // Set by every new connection: the session metadata in effect has to be published on it first.
+        var restoreContext = false
+        var restoreFailures = 0
         while (true) {
             if (!uplink.isConnected) {
                 if (!online.value) {
@@ -164,6 +202,7 @@ internal class CloudLink(
                     uplink.connect()
                     push { it.copy(cloudConnected = true, error = it.error?.takeUnless { error -> isCloudError(error) }) }
                     backoff = INITIAL_BACKOFF_MS
+                    restoreContext = true
                 } catch (c: CancellationException) {
                     throw c
                 } catch (auth: MqttAuthException) {
@@ -176,6 +215,34 @@ internal class CloudLink(
                     backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
                     continue
                 }
+            }
+
+            if (restoreContext) {
+                val outcome = restoreSessionMetadata()
+                val retry = when (outcome) {
+                    null, Outcome.Delivered -> false
+                    is Outcome.Refused -> {
+                        // Not retried: it would hold up the buffer, and the device's next session sends one.
+                        Slog.w(TAG, "session metadata of $deviceId refused on reconnect: ${outcome.reason.message}")
+                        false
+                    }
+                    Outcome.Stalled, Outcome.RejectedByDisconnect -> {
+                        if (outcome == Outcome.Stalled) runCatching { uplink.disconnect() }
+                        // Like a poison message: give up after as many tries as one would get.
+                        (++restoreFailures < MAX_PUBLISH_ATTEMPTS_WITH_DISCONNECT).also { retrying ->
+                            if (!retrying) Slog.w(TAG, "giving up re-sending session metadata of $deviceId")
+                        }
+                    }
+                    Outcome.ConnectionLost, Outcome.Throttled -> true
+                }
+                if (retry) {
+                    if (!uplink.isConnected) push { it.copy(cloudConnected = false) }
+                    awaitRetry(backoff)
+                    backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
+                    continue
+                }
+                restoreContext = false
+                restoreFailures = 0
             }
 
             val batch = buffer.peek(window, MAX_WINDOW_PAYLOAD_BYTES)
@@ -192,7 +259,7 @@ internal class CloudLink(
             var delivered = 0L
             batch.forEachIndexed { index, item ->
                 if (outcomes[index] == Outcome.Delivered) {
-                    buffer.remove(item)
+                    removeFromBuffer(item, published = true)
                     delivered++
                 }
             }
@@ -229,7 +296,7 @@ internal class CloudLink(
                 }
                 if (limit != null && ++failures >= limit) {
                     Slog.w(TAG, "dropping a message of $deviceId after $failures failed attempts")
-                    buffer.remove(item)
+                    removeFromBuffer(item, published = false)
                     failures = 0
                     pushBuffer()
                 }
@@ -244,6 +311,17 @@ internal class CloudLink(
             awaitRetry(backoff)
             backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
         }
+    }
+
+    /**
+     * Publishes the session metadata in effect — the one published last — on a new connection. Returns
+     * null if there is none, or if the next buffered message is session metadata itself.
+     */
+    private suspend fun restoreSessionMetadata(): Outcome? {
+        val metadata = synchronized(metadataLock) { currentMetadata } ?: return null
+        val next = buffer.peek().firstOrNull()
+        if (next != null && synchronized(metadataLock) { next.seq in metadataSeqs }) return null
+        return withTimeoutOrNull(PUBLISH_TIMEOUT_MS) { publish(metadata) } ?: Outcome.Stalled
     }
 
     /**
@@ -412,6 +490,9 @@ internal class CloudLink(
         /** Most messages in flight at once, and the most payload they may add up to. */
         const val MAX_WINDOW = 16
         const val MAX_WINDOW_PAYLOAD_BYTES = 256L * 1024
+
+        /** Session-metadata messages tracked in the buffer at most (one per BLE session in it). */
+        const val MAX_TRACKED_METADATA = 64
 
         /** Errors that a working cloud connection disproves (as opposed to Bluetooth-side ones). */
         fun isCloudError(error: DeviceError): Boolean =

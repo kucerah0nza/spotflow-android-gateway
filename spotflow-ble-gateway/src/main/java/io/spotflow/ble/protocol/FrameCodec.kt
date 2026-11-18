@@ -14,10 +14,11 @@ import java.io.ByteArrayOutputStream
  * Continuation fragment: [0] type  [1] flags  [2] seq  [3..]  payload
  * ```
  *
- * All fragments of one message share the same `type` and `seq`; `seq` increments per message and is
- * how the [Reassembler] groups fragments. Flags mark the first and last fragment; those two have been
- * exercised against the Device SDK on real hardware. [FLAG_NEEDS_ACK] is part of the protocol but the
- * gateway neither sets nor honours it (see [MessageType]).
+ * All fragments of one message share the same `type` and `seq`; `seq` increments per message (per type)
+ * and is how the [Reassembler] groups fragments. Flags mark the first and last fragment. [FLAG_NEEDS_ACK]
+ * (protocol 1.1) asks the receiver for an ACK/NACK control frame once the message is reassembled; the
+ * gateway sets it on nothing it sends, and the Device SDK sets it on nothing it sends, but a message whose
+ * fragments disagree on it is malformed. The remaining flag bits are reserved: they are ignored.
  */
 internal object FrameCodec {
 
@@ -100,11 +101,18 @@ internal object FrameCodec {
      * into a silently truncated (corrupt) payload being forwarded to the cloud. Memory is bounded: a
      * partial never grows past its declared length, and at most [MAX_PARTIALS] messages are in flight.
      */
-    class Reassembler {
+    class Reassembler(
+        /**
+         * Which message types to reassemble. Frames of any other type — and ACK/NACK control frames, which
+         * are never fragmented — are dropped on arrival, so a type the gateway does not handle (e.g. OTA
+         * traffic) takes no memory and cannot push a wanted message out of the in-flight partials.
+         */
+        private val accept: (MessageType) -> Boolean = { true },
+    ) {
 
         private data class Key(val type: Int, val seq: Int)
 
-        private class Partial(val expectedLength: Int) {
+        private class Partial(val expectedLength: Int, val needsAck: Boolean) {
             val buffer = ByteArrayOutputStream(expectedLength)
         }
 
@@ -124,10 +132,13 @@ internal object FrameCodec {
             if (raw.size < HEADER_CONTINUATION) return null
 
             val rawType = raw[0].toInt() and 0xFF
+            // Unknown, control (ACK/NACK: byte 1 is the acknowledged type, not flags) or unwanted: drop.
+            val type = MessageType.fromValue(rawType)?.takeIf { !it.isControl && accept(it) } ?: return null
             val flags = raw[1].toInt() and 0xFF
             val seq = raw[2].toInt() and 0xFF
             val isFirst = flags and FLAG_IS_FIRST != 0
             val isLast = flags and FLAG_IS_LAST != 0
+            val needsAck = flags and FLAG_NEEDS_ACK != 0
             val key = Key(rawType, seq)
 
             val partial: Partial
@@ -135,12 +146,17 @@ internal object FrameCodec {
             if (isFirst) {
                 if (raw.size < HEADER_FIRST) return null
                 val expected = (raw[3].toInt() and 0xFF) or ((raw[4].toInt() and 0xFF) shl 8)
-                partial = Partial(expected)
+                partial = Partial(expected, needsAck)
                 partials[key] = partial
                 dataStart = HEADER_FIRST
             } else {
                 partial = partials[key] ?: return null // continuation without a first fragment
                 dataStart = HEADER_CONTINUATION
+            }
+            if (partial.needsAck != needsAck) {
+                // The protocol requires NEEDS_ACK in every fragment or in none: a mix is a corrupt stream.
+                partials.remove(key)
+                return null
             }
 
             val chunk = raw.size - dataStart
@@ -156,7 +172,6 @@ internal object FrameCodec {
 
             partials.remove(key)
             if (partial.buffer.size() != partial.expectedLength) return null // a fragment was lost
-            val type = MessageType.fromValue(rawType) ?: return null // unknown type: drop
             return Message(type, partial.buffer.toByteArray())
         }
 

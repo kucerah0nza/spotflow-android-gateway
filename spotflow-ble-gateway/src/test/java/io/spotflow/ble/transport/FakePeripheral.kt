@@ -45,7 +45,7 @@ internal class FakePeripheral(address: String = "AA:BB:CC:DD:EE:FF") {
 
     /** What reading each characteristic returns. */
     val values = hashMapOf(
-        GattProfile.CAPABILITIES to byteArrayOf(1),
+        GattProfile.CAPABILITIES to byteArrayOf(1, 1, 0),
         GattProfile.DEVICE_ID to "attached-device".toByteArray(),
         GattProfile.SESSION_METADATA to "meta".toByteArray(),
     )

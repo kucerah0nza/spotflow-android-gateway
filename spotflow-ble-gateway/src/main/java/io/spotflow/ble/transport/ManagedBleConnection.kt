@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.content.Context
+import io.spotflow.ble.protocol.DeviceCapabilities
 import io.spotflow.ble.protocol.GattProfile
 import io.spotflow.ble.protocol.Message
 import kotlinx.coroutines.flow.Flow
@@ -64,9 +65,8 @@ internal class ManagedBleConnection(
         session.prepare()
     }
 
-    override suspend fun readProtocolVersion(): Int =
-        session.read(GattProfile.CAPABILITIES).firstOrNull()?.toInt()?.and(0xFF)
-            ?: throw IllegalStateException("Capabilities characteristic is empty")
+    override suspend fun readCapabilities(): DeviceCapabilities =
+        DeviceCapabilities.parse(session.read(GattProfile.CAPABILITIES))
 
     override suspend fun startStreaming() = session.startStreaming()
 

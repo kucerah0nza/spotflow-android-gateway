@@ -9,6 +9,7 @@ import io.spotflow.ble.cloud.MessageStore
 import io.spotflow.ble.cloud.Uplink
 import io.spotflow.ble.cloud.UplinkDisconnectedException
 import io.spotflow.ble.cloud.UplinkThrottledException
+import io.spotflow.ble.protocol.DeviceCapabilities
 import io.spotflow.ble.protocol.Message
 import io.spotflow.ble.protocol.MessageType
 import io.spotflow.ble.transport.BleConnection
@@ -115,6 +116,49 @@ class GatewaySessionTest {
         assertEquals(listOf("prepare", "capabilities", "deviceId", "metadata", "notifications"), ble.operations)
         assertTrue("session metadata is published", uplink.publishedTo("ingest-cbor", "meta".toByteArray()))
         ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `session metadata is published again ahead of everything else after an MQTT reconnect`() = runTest {
+        val ble = FakeBleConnection()
+        val uplink = FakeUplink()
+        val job = launch { runCatching { session(ble, uplink).run() } }
+        runCurrent()
+
+        uplink.loseConnection()
+        runCurrent()
+        ble.emit(Message(MessageType.TELEMETRY, byteArrayOf(7)))
+        runCurrent()
+
+        assertEquals(2, uplink.connectCount)
+        val ingest = uplink.published.filter { it.first == "ingest-cbor" }.map { it.second.toList() }
+        val meta = "meta".toByteArray().toList()
+        assertEquals("the cloud keeps it per connection", listOf(meta, meta, listOf<Byte>(7)), ingest)
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `a reconnect does not re-send old session metadata ahead of the device's newer one`() = runTest {
+        val uplink = FakeUplink()
+        val links = registry(backgroundScope, uplink)
+        val first = FakeBleConnection().apply { sessionMetadata = byteArrayOf(1) }
+        val firstJob = launch { runCatching { session(first, uplink, links).run() } }
+        runCurrent()
+        first.drop(); runCurrent(); firstJob.cancel()
+
+        // The device reboots while the phone is offline: its new session's metadata waits in the buffer.
+        uplink.failConnect = true
+        uplink.loseConnection()
+        val second = FakeBleConnection().apply { sessionMetadata = byteArrayOf(2) }
+        val secondJob = launch { runCatching { session(second, uplink, links).run() } }
+        runCurrent()
+        second.emit(Message(MessageType.TELEMETRY, byteArrayOf(9)))
+        uplink.failConnect = false
+        advanceTimeBy(60_000); runCurrent()
+
+        val ingest = uplink.published.filter { it.first == "ingest-cbor" }.map { it.second.toList() }
+        assertEquals(listOf(listOf<Byte>(1), listOf<Byte>(2), listOf<Byte>(9)), ingest)
+        second.drop(); runCurrent(); secondJob.cancel()
     }
 
     @Test
@@ -773,7 +817,7 @@ internal class FakeBleConnection(
         operations += "prepare"
         stateFlow.value = ConnectionState.PREPARING
     }
-    override suspend fun readProtocolVersion(): Int { operations += "capabilities"; return 1 }
+    override suspend fun readCapabilities() = DeviceCapabilities(1, 1, 0).also { operations += "capabilities" }
     /** Like the Device SDK: once notifications are on, the device sends its reported configuration. */
     var reportsConfiguration = true
     override suspend fun startStreaming() {
@@ -783,7 +827,8 @@ internal class FakeBleConnection(
     }
     fun reportConfiguration() { emit(Message(MessageType.REPORTED_CONFIGURATION, byteArrayOf(0x7E))) }
     override suspend fun readDeviceId(): String { operations += "deviceId"; return deviceId }
-    override suspend fun readSessionMetadata(): ByteArray { operations += "metadata"; return "meta".toByteArray() }
+    var sessionMetadata = "meta".toByteArray()
+    override suspend fun readSessionMetadata(): ByteArray { operations += "metadata"; return sessionMetadata }
     var rssiReads = 0
     override suspend fun readRssi(): Int { rssiReads++; return -55 }
     override suspend fun sendDesiredConfiguration(payload: ByteArray) {

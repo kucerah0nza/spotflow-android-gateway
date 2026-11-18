@@ -89,23 +89,37 @@ devices never come back.
   Device ID (`0003`), Session Metadata (`0004`), TX Stream `NOTIFY` (`0005`), RX Stream `WRITE`-no-response
   (`0006`).
 - **Connection order** — as the protocol specifies: discover services and negotiate MTU, read
-  Capabilities (protocol version), Device ID and Session Metadata, and only then enable TX Stream
+  Capabilities, Device ID and Session Metadata, and only then enable TX Stream
   notifications. (Some devices stop answering reads once their TX stream is running.)
 - **Link parameters** — if a device requests a supervision timeout shorter than 2 s (seen: 420 ms, which
   drops the link on any brief radio gap), the gateway asks Android for balanced connection priority, which
   renegotiates a 5 s timeout. Managed mode only.
 - **Framing** — a message may exceed the negotiated ATT MTU (as low as 23 bytes), so it is split into
   fragments. `FrameCodec` handles fragmentation (outgoing) and reassembly (incoming). Flags: `IS_FIRST`
-  (`0x01`), `IS_LAST` (`0x02`).
+  (`0x01`), `IS_LAST` (`0x02`), `NEEDS_ACK` (`0x04`, protocol 1.1; used only by OTA, so the gateway sets it
+  on nothing, and drops a message whose fragments disagree on it). The other bits are reserved and
+  ignored.
+- **Protocol version** — the gateway speaks protocol 1.1 and works with 1.0 devices. Capabilities holds
+  the major and minor version and, from 1.1, a feature byte whose bit 0 says the device takes OTA updates
+  through the gateway. This gateway does not relay OTA updates yet: such a device is relayed for
+  telemetry and configuration, which is all it can do through a gateway without OTA.
+- **Encryption** — a device can require an encrypted (paired) link for everything but Capabilities; the
+  Device SDK does by default when built with OTA. Pair (bond) such a device with the phone, or the
+  session fails with an error saying so.
 - **Message types** — `TELEMETRY` (`0x02`), `REPORTED_CONFIGURATION` (`0x03`),
   `DESIRED_CONFIGURATION` (`0x04`). Telemetry payloads carry logs, metrics **and core-dump chunks**; the
-  gateway relays them opaquely (CBOR is not parsed).
+  gateway relays them opaquely (CBOR is not parsed). The OTA types of protocol 1.1 (`OTA_D2C` `0x05`,
+  `OTA_C2D` `0x06`, `ARTIFACT_REQUEST` `0x07`, `ARTIFACT_RESPONSE` `0x08`) are dropped on arrival, as are
+  `ACK`/`NACK` control frames (`0x00`/`0x01`), which only answer messages the gateway does not send.
 - **Cloud** — one MQTT-over-TLS connection per device to `mqtt.spotflow.io:8883`, QoS 1, with MQTT
   `username = device ID` and `password = ingest key`. TLS is validated by the Android system trust store
   (Let's Encrypt ISRG Root X1 — no bundled CA). Telemetry and session metadata publish to `ingest-cbor`,
   reported configuration to `config-cbor-d2c`; desired configuration (e.g. the minimal log severity set
   in the portal) is received from `config-cbor-c2d` and written down the RX Stream, in order, and
   acknowledged to the broker only once written.
+- **Session metadata** is read from the device at the start of every BLE session and published ahead of
+  its telemetry. The cloud applies it per MQTT connection, so after a reconnect the gateway publishes the
+  one in effect again before anything else.
 - **Desired configuration details** — the broker publishes it on a per-device topic *below* the
   subscribed one (`config-cbor-c2d/<workspace>/<device>`), so, like the Device SDK, the gateway matches
   the topic by prefix. It is written only after the device has sent its reported configuration in the

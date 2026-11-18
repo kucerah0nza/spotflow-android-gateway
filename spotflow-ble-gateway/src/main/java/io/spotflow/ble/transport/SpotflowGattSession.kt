@@ -61,6 +61,22 @@ internal class SpotflowGattSession(
          */
         private const val MIN_SUPERVISION_TIMEOUT = 200
         private const val MAX_PRIORITY_REQUESTS = 3
+
+        /** `GATT_AUTH_FAIL`: pairing failed or was declined (not in the public SDK). */
+        private const val GATT_AUTH_FAIL = 0x89
+
+        /**
+         * A failed operation's GATT status, explained where the user has to act. A device can require an
+         * encrypted link for everything but its Capabilities (the Device SDK does by default when it is
+         * built with OTA), and then answers an unpaired gateway with one of these.
+         */
+        internal fun describeStatus(status: Int): String = when (status) {
+            BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION,
+            BluetoothGatt.GATT_INSUFFICIENT_ENCRYPTION,
+            GATT_AUTH_FAIL,
+            -> "$status, the device requires an encrypted link: pair (bond) it with this phone"
+            else -> status.toString()
+        }
     }
 
     /** An outstanding operation on the characteristic [uuid], completed by the callback that answers it. */
@@ -88,7 +104,8 @@ internal class SpotflowGattSession(
     var mtu: Int = FrameCodec.MIN_MTU
         private set
 
-    private val reassembler = FrameCodec.Reassembler()
+    // Only what the gateway relays: OTA messages of an OTA-capable device are dropped on arrival.
+    private val reassembler = FrameCodec.Reassembler { it.isRelayed }
 
     // Serializes GATT operations. Only one operation is in flight, so a single pending slot suffices.
     private val opLock = Mutex()
@@ -176,7 +193,7 @@ internal class SpotflowGattSession(
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 pending.result.complete(Unit)
             } else {
-                pending.result.completeExceptionally(IllegalStateException("characteristic write failed: $status"))
+                pending.result.completeExceptionally(IllegalStateException("characteristic write failed: ${describeStatus(status)}"))
             }
         }
 
@@ -190,7 +207,7 @@ internal class SpotflowGattSession(
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 pending.result.complete(Unit)
             } else {
-                pending.result.completeExceptionally(IllegalStateException("descriptor write failed: $status"))
+                pending.result.completeExceptionally(IllegalStateException("descriptor write failed: ${describeStatus(status)}"))
             }
         }
 
@@ -258,7 +275,9 @@ internal class SpotflowGattSession(
         if (status == BluetoothGatt.GATT_SUCCESS) {
             pending.result.complete(value.copyOf())
         } else {
-            pending.result.completeExceptionally(IllegalStateException("characteristic read failed: $status"))
+            pending.result.completeExceptionally(
+                IllegalStateException("${GattProfile.name(uuid)} read failed: ${describeStatus(status)}"),
+            )
         }
     }
 

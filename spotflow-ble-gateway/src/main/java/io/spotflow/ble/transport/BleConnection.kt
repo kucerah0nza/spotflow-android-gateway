@@ -1,5 +1,6 @@
 package io.spotflow.ble.transport
 
+import io.spotflow.ble.protocol.DeviceCapabilities
 import io.spotflow.ble.protocol.Message
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
@@ -51,8 +52,8 @@ internal interface BleConnection {
      */
     suspend fun prepare()
 
-    /** Reads the protocol version from the Capabilities characteristic (the first byte). */
-    suspend fun readProtocolVersion(): Int
+    /** Reads the Capabilities characteristic: protocol version and feature bits. */
+    suspend fun readCapabilities(): DeviceCapabilities
 
     /** Enables TX Stream notifications; [state] then reaches [ConnectionState.READY]. */
     suspend fun startStreaming()
