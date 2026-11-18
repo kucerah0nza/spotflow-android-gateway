@@ -14,7 +14,6 @@ import com.hivemq.client.mqtt.mqtt5.message.connect.connack.Mqtt5ConnAckReasonCo
 import com.hivemq.client.mqtt.mqtt5.message.disconnect.Mqtt5DisconnectReasonCode
 import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5Publish
 import com.hivemq.client.mqtt.mqtt5.message.publish.puback.Mqtt5PubAckReasonCode
-import com.hivemq.client.mqtt.mqtt5.message.subscribe.suback.Mqtt5SubAck
 import io.spotflow.ble.Slog
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -35,7 +34,8 @@ import kotlin.coroutines.resumeWithException
  * Delivery is at-least-once (QoS 1 with a persistent session): when a connection is lost, the publishes
  * still waiting for their acknowledgement may or may not have reached the broker, and the gateway sends
  * them again — so the backend must tolerate duplicates. Reassembled BLE messages are published as CBOR
- * payloads; desired configuration arriving from the cloud is delivered to [desiredConfigurationHandler].
+ * payloads; desired configuration and OTA commands arriving from the cloud are delivered to
+ * [desiredConfigurationHandler] and [otaCommandHandler].
  *
  * TLS uses the Android system trust store (Let's Encrypt ISRG Root X1), so no CA is bundled. This client
  * does not reconnect on its own — the gateway's drainer owns the connect/reconnect lifecycle so it can
@@ -66,7 +66,34 @@ internal class MqttUplink(
     override var desiredConfigurationHandler: ((ByteArray, () -> Unit) -> Unit)? = null
 
     @Volatile
+    override var otaCommandHandler: ((ByteArray, () -> Unit) -> Unit)? = null
+
+    @Volatile
     override var onConnectionLost: (() -> Unit)? = null
+
+    override val isOtaSubscribed: Boolean get() = session.let { it.isReady && it.otaSubscribed }
+
+    @Volatile
+    override var mayHoldOtaSubscription: Boolean = false
+        private set
+
+    override suspend fun subscribeOta() {
+        val current = readySession()
+        // Before the SUBACK: the broker may hold the subscription even if the answer never arrives.
+        mayHoldOtaSubscription = true
+        current.subscribe(config.topics.otaCommands)
+        current.otaSubscribed = true
+    }
+
+    override suspend fun unsubscribeOta() {
+        val current = readySession()
+        current.unsubscribe(config.topics.otaCommands)
+        current.otaSubscribed = false
+        mayHoldOtaSubscription = false
+    }
+
+    private fun readySession(): ClientSession =
+        session.takeIf { it.isReady } ?: throw UplinkDisconnectedException("MQTT is not connected", rejectedByBroker = false)
 
     private val qos: MqttQos = when (config.qos) {
         PublishQos.AT_MOST_ONCE -> MqttQos.AT_MOST_ONCE
@@ -120,6 +147,9 @@ internal class MqttUplink(
         /** Connected and subscribed. */
         @Volatile var ready = false
 
+        /** Subscribed to OTA commands on the current connection. */
+        @Volatile var otaSubscribed = false
+
         /** A publish was abandoned while in flight: the client would re-send it on its own. */
         @Volatile var tainted = false
 
@@ -155,6 +185,7 @@ internal class MqttUplink(
 
         suspend fun connect(ingestKey: String) {
             ready = false
+            otaSubscribed = false
             lost = CompletableDeferred()
             val pending = client.connectWith()
                 .simpleAuth()
@@ -170,31 +201,49 @@ internal class MqttUplink(
             // when it ends — and discard() needs to know that.
             pending.await(cancelFuture = false)
 
+            subscribe(config.topics.desiredConfiguration)
+            ready = true
+        }
+
+        /**
+         * Subscribes to [topic] at the configured QoS. Throws [MqttConnectException] if the connection is
+         * lost meanwhile or the broker refuses.
+         */
+        suspend fun subscribe(topic: String) {
             // No per-subscription callback: messages are handled by the global handler registered in
             // buildClient() (see onCloudMessage for why).
-            // Raced against the connection, like a publish: with a persistent session the client does not
-            // fail a pending subscribe when the connection drops — it would sit there until the session
-            // expires, over an hour later, and the drain loop with it.
-            val connectionLost = lost
-            val subscribing = client.subscribeWith()
-                .topicFilter(config.topics.desiredConfiguration)
-                .qos(qos)
-                .send()
-            val subscribed = CompletableDeferred<Mqtt5SubAck>()
-            subscribing.whenComplete { ack, error ->
-                if (error != null) subscribed.completeExceptionally(error) else subscribed.complete(ack)
-            }
-            val subAck = select<Mqtt5SubAck> {
-                subscribed.onAwait { it }
-                connectionLost.onAwait { throw MqttConnectException("MQTT connection lost while subscribing") }
+            val subAck = raceAgainstConnection("subscribing to '$topic'") {
+                client.subscribeWith().topicFilter(topic).qos(qos).send()
             }
             // The broker answers per topic filter; a refusal still completes the SUBACK normally.
             val reasons = subAck.reasonCodes
-            Slog.d(TAG, "subscribed $deviceId to '${config.topics.desiredConfiguration}': $reasons")
-            if (reasons.any { it.isError }) {
-                throw MqttConnectException("Broker refused the desired-configuration subscription ($reasons)")
+            Slog.d(TAG, "subscribed $deviceId to '$topic': $reasons")
+            if (reasons.any { it.isError }) throw MqttConnectException("Broker refused the subscription to '$topic' ($reasons)")
+        }
+
+        suspend fun unsubscribe(topic: String) {
+            val unsubAck = raceAgainstConnection("unsubscribing from '$topic'") {
+                client.unsubscribeWith().topicFilter(topic).send()
             }
-            ready = true
+            Slog.d(TAG, "unsubscribed $deviceId from '$topic': ${unsubAck.reasonCodes}")
+        }
+
+        /**
+         * Awaits [request], but fails as soon as the connection is lost: with a persistent session the client
+         * does not fail a pending (un)subscribe when the connection drops — it would sit there until the
+         * session expires, over an hour later, and the drain loop with it.
+         */
+        private suspend fun <T> raceAgainstConnection(what: String, request: () -> CompletableFuture<T>): T {
+            val connectionLost = lost
+            if (connectionLost.isCompleted) throw MqttConnectException("MQTT connection lost before $what")
+            val result = CompletableDeferred<T>()
+            request().whenComplete { value, error ->
+                if (error != null) result.completeExceptionally(error) else result.complete(value)
+            }
+            return select {
+                result.onAwait { it }
+                connectionLost.onAwait { throw MqttConnectException("MQTT connection lost while $what") }
+            }
         }
 
         @OptIn(ExperimentalCoroutinesApi::class)
@@ -263,14 +312,18 @@ internal class MqttUplink(
         private fun onCloudMessage(publish: Mqtt5Publish) {
             if (this !== session) return // a discarded client: leave it unacknowledged for the live one
             val topic = publish.topic.toString()
-            if (!isDesiredConfigurationTopic(config.topics.desiredConfiguration, topic)) {
-                Slog.w(TAG, "ignoring message for $deviceId on unexpected topic '$topic'")
-                runCatching { publish.acknowledge() } // nothing to deliver; don't leave it pending
-                return
+            val (kind, handler) = when {
+                isTopicOrBelow(config.topics.desiredConfiguration, topic) -> "desired configuration" to desiredConfigurationHandler
+                isTopicOrBelow(config.topics.otaCommands, topic) -> "OTA command" to otaCommandHandler
+                else -> {
+                    Slog.w(TAG, "ignoring message for $deviceId on unexpected topic '$topic'")
+                    runCatching { publish.acknowledge() } // nothing to deliver; don't leave it pending
+                    return
+                }
             }
-            Slog.d(TAG, "desired configuration for $deviceId on '$topic' (${publish.payloadAsBytes.size} bytes)")
+            Slog.d(TAG, "$kind for $deviceId on '$topic' (${publish.payloadAsBytes.size} bytes)")
             // No handler: leave it unacknowledged so the broker redelivers it rather than it being lost.
-            val handler = desiredConfigurationHandler ?: return
+            handler ?: return
             handler(publish.payloadAsBytes) { runCatching { publish.acknowledge() } }
         }
     }
@@ -303,8 +356,8 @@ internal class MqttUplink(
     }
 
     companion object {
-        /** Whether [topic] carries desired configuration: [base] itself or any topic below it. */
-        internal fun isDesiredConfigurationTopic(base: String, topic: String): Boolean =
+        /** Whether [topic] is [base] itself or any topic below it. */
+        internal fun isTopicOrBelow(base: String, topic: String): Boolean =
             topic == base || topic.startsWith("$base/")
 
         /**

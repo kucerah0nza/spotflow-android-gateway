@@ -16,6 +16,8 @@ import io.spotflow.ble.cloud.CredentialsProvider
 import io.spotflow.ble.cloud.MqttConfig
 import io.spotflow.ble.cloud.MqttUplink
 import io.spotflow.ble.cloud.Uplink
+import io.spotflow.ble.ota.ArtifactDownloader
+import io.spotflow.ble.ota.HttpArtifactDownloader
 import io.spotflow.ble.transport.BleConnection
 import io.spotflow.ble.transport.ManagedBleConnection
 import io.spotflow.ble.transport.SpotflowScanner
@@ -55,6 +57,9 @@ internal interface GatewayPlatform {
     fun scan(lowPower: Boolean): Flow<DiscoveredDevice>
 
     fun createUplink(deviceId: String): Uplink
+
+    /** Downloads OTA artifacts. */
+    val artifactDownloader: ArtifactDownloader get() = HttpArtifactDownloader()
 
     /** Whether [device] has a GATT link up right now (attach mode). */
     fun isGattConnected(device: BluetoothDevice): Boolean

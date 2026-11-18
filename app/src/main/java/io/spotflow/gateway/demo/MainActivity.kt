@@ -26,6 +26,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import io.spotflow.ble.DeviceError
 import io.spotflow.ble.GatewayDeviceState
+import io.spotflow.ble.OtaTransfer
 import io.spotflow.ble.GatewayStatus
 import io.spotflow.ble.ScanState
 import io.spotflow.ble.cloud.BufferUsage
@@ -420,6 +421,19 @@ class MainActivity : AppCompatActivity() {
             appendLine(line("Received", "${d.received} msgs"))
             // Messages not yet uploaded; where they sit (RAM or flash) is shown for the whole gateway above.
             append(line("Waiting", "${d.pendingMessages} msgs · ${humanBytes(d.ramBytes + d.diskBytes)}"))
+            if (d.otaEnabled) {
+                appendLine()
+                append(line("OTA update", otaText(d.otaTransfer)))
+            }
+        }
+    }
+
+    private fun otaText(transfer: OtaTransfer?): String {
+        val size = transfer?.sizeBytes
+        return when {
+            transfer == null -> "idle"
+            size == null -> "downloading firmware…"
+            else -> "${transfer.deliveredBytes * 100 / size}% · ${humanBytes(transfer.deliveredBytes)} of ${humanBytes(size)}"
         }
     }
 

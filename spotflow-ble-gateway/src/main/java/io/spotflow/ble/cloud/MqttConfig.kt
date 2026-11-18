@@ -1,14 +1,18 @@
 package io.spotflow.ble.cloud
 
 /**
- * MQTT topic names on the Spotflow broker. Telemetry and reported configuration are published to fixed
- * topics; desired configuration arrives on a per-device topic *below* [desiredConfiguration]
- * (`config-cbor-c2d/<workspace>/<device>`), so that one is matched by prefix.
+ * MQTT topic names on the Spotflow broker. Telemetry, reported configuration and OTA results are published
+ * to fixed topics; desired configuration and OTA commands arrive on a per-device topic *below* the one
+ * subscribed to (`config-cbor-c2d/<workspace>/<device>`), so those are matched by prefix.
  */
 public data class SpotflowTopics(
     val ingest: String = "ingest-cbor",
     val reportedConfiguration: String = "config-cbor-d2c",
     val desiredConfiguration: String = "config-cbor-c2d",
+    /** OTA commands for the device (subscribed to only for devices that take OTA updates). */
+    val otaCommands: String = "ota-cbor-c2d",
+    /** The device's OTA update results. */
+    val otaResults: String = "ota-cbor-d2c",
 )
 
 /** MQTT delivery guarantee for the messages the gateway publishes. */

@@ -1,6 +1,8 @@
 package io.spotflow.ble
 
 import io.spotflow.ble.cloud.MqttConfig
+import io.spotflow.ble.ota.ArtifactCache
+import io.spotflow.ble.ota.ArtifactServer
 import io.spotflow.ble.protocol.DeviceCapabilities
 import io.spotflow.ble.protocol.MessageType
 import io.spotflow.ble.transport.BleConnection
@@ -14,7 +16,9 @@ import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.plus
 import kotlinx.coroutines.withContext
 
 /**
@@ -40,6 +44,8 @@ internal class GatewaySession(
      * true. `null` never reads it — for attached connections, whose GATT queue belongs to the host.
      */
     private val rssiWanted: Flow<Boolean>? = null,
+    /** Where OTA artifacts are downloaded to; null when the gateway's OTA is off. */
+    private val artifacts: ArtifactCache? = null,
 ) {
     /** Runs until the connection is torn down or the coroutine is cancelled. */
     suspend fun run() = coroutineScope {
@@ -56,20 +62,23 @@ internal class GatewaySession(
             // Order per the Spotflow BLE protocol: read Capabilities, Device ID and Session Metadata
             // first; enable the TX stream last.
             connection.prepare()
-            try {
+            // OTA only for a device that advertises it in a protocol version this gateway knows (and only
+            // if the gateway's OTA is on): anything else is relayed for telemetry and configuration only.
+            val ota = try {
                 val capabilities = connection.readCapabilities()
                 if (!capabilities.isCompatible) {
                     Slog.w(TAG, "device speaks protocol $capabilities; this gateway speaks ${DeviceCapabilities.SUPPORTED_MAJOR}.x")
-                } else if (capabilities.otaSupported) {
-                    // The device then works without OTA: it updates over BLE only through a gateway that
-                    // forwards its OTA messages, which this one does not do yet.
-                    Slog.i(TAG, "device supports OTA updates (protocol $capabilities); they are not relayed by this gateway")
+                } else if (capabilities.otaSupported && artifacts == null) {
+                    Slog.i(TAG, "device supports OTA updates (protocol $capabilities); OTA is turned off in this gateway")
                 }
+                capabilities.isCompatible && capabilities.otaSupported && artifacts != null
             } catch (c: CancellationException) {
                 throw c
             } catch (t: Throwable) {
                 Slog.w(TAG, "could not read capabilities: ${t.message}")
+                false
             }
+            push { it.copy(otaEnabled = ota, otaTransfer = null) }
             val deviceId = connection.readDeviceId()
             if (deviceId.isBlank()) throw DeviceRejectedException("device reported an empty device ID")
             push { it.copy(deviceId = deviceId) }
@@ -78,6 +87,7 @@ internal class GatewaySession(
             }
 
             val link = links.claim(deviceId, push)
+            link.setOtaEnabled(ota)
             // Everything of this session that uses the link; see the hand-over below.
             val linkUsers = ArrayList<Job>()
             try {
@@ -95,6 +105,19 @@ internal class GatewaySession(
                 // then it accepts RX writes but silently discards them.
                 val deviceAcceptsConfiguration = CompletableDeferred<Unit>()
 
+                // Completed once the TX stream is on: the device acknowledges OTA commands over it.
+                val streaming = CompletableDeferred<Unit>()
+
+                // Artifact requests are answered in a scope of their own: an OPEN can wait minutes for its
+                // download, and the session must not wait for that when it ends.
+                val artifactJob = Job(coroutineContext.job).also { linkUsers += it }
+                val artifactScope = this + artifactJob
+                val artifactServer = artifacts?.takeIf { ota }?.let { cache ->
+                    ArtifactServer(cache, deviceId, connection::sendArtifactResponse) { transfer ->
+                        push { it.copy(otaTransfer = transfer) }
+                    }
+                }
+
                 // BLE -> buffer (RAM first; never blocks on the network).
                 linkUsers += launch {
                     connection.incoming.collect { message ->
@@ -105,6 +128,11 @@ internal class GatewaySession(
                                     Slog.d(TAG, "$deviceId reported its configuration; desired configuration can be delivered")
                                 }
                                 mqttConfig.topics.reportedConfiguration
+                            }
+                            MessageType.OTA_D2C -> mqttConfig.topics.otaResults.takeIf { ota } ?: return@collect
+                            MessageType.ARTIFACT_REQUEST -> {
+                                artifactServer?.handle(artifactScope, message.payload)
+                                return@collect
                             }
                             else -> return@collect
                         }
@@ -123,8 +151,17 @@ internal class GatewaySession(
                     link.deliverDesiredConfiguration { connection.sendDesiredConfiguration(it) }
                 }
 
+                // OTA commands, each acknowledged to the broker once the device has acknowledged it.
+                if (ota) {
+                    linkUsers += launch {
+                        streaming.await()
+                        link.deliverOtaCommands { connection.sendOtaCommand(it) }
+                    }
+                }
+
                 // Reads are done: start the device's TX stream.
                 connection.startStreaming()
+                streaming.complete(Unit)
 
                 // Sample the BLE signal strength, but only while someone is watching it.
                 val rssiJob = rssiWanted?.let { wanted ->
@@ -168,7 +205,7 @@ internal class GatewaySession(
             withContext(NonCancellable) { connection.close() }
             // The state collector is gone by now, so say it here: whatever ended the session — a drop, an
             // error, a rejected key — the BLE link is no longer up.
-            push { it.copy(ble = ConnectionState.DISCONNECTED, rssi = null) }
+            push { it.copy(ble = ConnectionState.DISCONNECTED, rssi = null, otaTransfer = null) }
         }
     }
 

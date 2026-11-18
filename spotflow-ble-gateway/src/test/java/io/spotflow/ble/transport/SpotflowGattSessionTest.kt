@@ -74,7 +74,7 @@ class SpotflowGattSessionTest {
     @Test
     fun `a write result for another characteristic does not complete the gateway's write`() = runTest {
         prepared()
-        val write = launch { session.writeDesiredConfiguration(byteArrayOf(1, 2, 3)) }
+        val write = launch { session.writeMessage(MessageType.DESIRED_CONFIGURATION, byteArrayOf(1, 2, 3)) }
         runCurrent()
 
         session.callback.onCharacteristicWrite(peripheral.gatt, peripheral.hostCharacteristic, BluetoothGatt.GATT_SUCCESS)
@@ -248,5 +248,104 @@ class SpotflowGattSessionTest {
 
         assertTrue(failed.isFailure)
         assertEquals("not left showing CONNECTING", ConnectionState.DISCONNECTED, fresh.state.value)
+    }
+
+    // ---- NEEDS_ACK messages (OTA commands) -----------------------------------------------------------
+
+    /** Sends an OTA command and answers its writes, leaving the session waiting for the device's verdict. */
+    private fun TestScope.sendOta(payload: ByteArray) = async { runCatching { session.writeAcknowledged(MessageType.OTA_C2D, payload) } }
+        .also { answerAll() }
+
+    private fun TestScope.control(type: MessageType, ackedType: MessageType, seq: Int) {
+        peripheral.notify(session.callback, peripheral.tx, byteArrayOf(type.value.toByte(), ackedType.value.toByte(), seq.toByte()))
+        runCurrent()
+    }
+
+    @Test
+    fun `an acknowledged message is written with NEEDS_ACK and completes on the device's ACK for it`() = runTest {
+        prepared()
+        val sending = sendOta(byteArrayOf(1, 2, 3))
+
+        val frame = peripheral.rxWrites.single()
+        assertEquals(MessageType.OTA_C2D.value, frame[0].toInt())
+        assertEquals(FrameCodec.FLAG_NEEDS_ACK, frame[1].toInt() and FrameCodec.FLAG_NEEDS_ACK)
+        val seq = frame[2].toInt()
+
+        // Not an answer to it: another type, another sequence number.
+        control(MessageType.ACK, MessageType.DESIRED_CONFIGURATION, seq)
+        control(MessageType.ACK, MessageType.OTA_C2D, seq + 1)
+        assertFalse(sending.isCompleted)
+
+        control(MessageType.ACK, MessageType.OTA_C2D, seq)
+        assertTrue(sending.await().isSuccess)
+    }
+
+    @Test
+    fun `a NACK retransmits the same message, with the same sequence number, after a backoff`() = runTest {
+        prepared()
+        val sending = sendOta(byteArrayOf(4, 5))
+        val first = peripheral.rxWrites.single()
+
+        control(MessageType.NACK, MessageType.OTA_C2D, first[2].toInt())
+        advanceTimeBy(999); runCurrent()
+        assertEquals("backs off before retransmitting", 1, peripheral.rxWrites.size)
+        advanceTimeBy(2); answerAll()
+
+        assertEquals(2, peripheral.rxWrites.size)
+        assertArrayEquals(first, peripheral.rxWrites[1])
+        control(MessageType.ACK, MessageType.OTA_C2D, first[2].toInt())
+        assertTrue(sending.await().isSuccess)
+    }
+
+    @Test
+    fun `no answer retransmits after the ACK timeout`() = runTest {
+        prepared()
+        val sending = sendOta(byteArrayOf(6))
+
+        advanceTimeBy(SpotflowGattSession.ACK_TIMEOUT_MS + 1_001); answerAll()
+
+        assertEquals(2, peripheral.rxWrites.size)
+        assertArrayEquals(peripheral.rxWrites[0], peripheral.rxWrites[1])
+        control(MessageType.ACK, MessageType.OTA_C2D, peripheral.rxWrites[0][2].toInt())
+        assertTrue(sending.await().isSuccess)
+    }
+
+    @Test
+    fun `the next acknowledged message of a type gets the next sequence number`() = runTest {
+        prepared()
+        val first = sendOta(byteArrayOf(1))
+        control(MessageType.ACK, MessageType.OTA_C2D, peripheral.rxWrites[0][2].toInt())
+        first.await()
+        val second = sendOta(byteArrayOf(2))
+
+        assertEquals((peripheral.rxWrites[0][2] + 1).toByte(), peripheral.rxWrites[1][2])
+        control(MessageType.ACK, MessageType.OTA_C2D, peripheral.rxWrites[1][2].toInt())
+        assertTrue(second.await().isSuccess)
+    }
+
+    @Test
+    fun `a message waiting for its ACK fails when the link goes down`() = runTest {
+        prepared()
+        val sending = sendOta(byteArrayOf(7))
+
+        session.callback.onConnectionStateChange(peripheral.gatt, 8, BluetoothProfile.STATE_DISCONNECTED)
+        runCurrent()
+
+        assertTrue(sending.await().isFailure)
+    }
+
+    @Test
+    fun `control frames never reach the incoming messages`() = runTest {
+        prepared()
+        val received = async { session.incoming.first() }
+        runCurrent()
+
+        control(MessageType.ACK, MessageType.OTA_C2D, 0)
+        control(MessageType.NACK, MessageType.OTA_C2D, 0)
+        FrameCodec.fragment(MessageType.OTA_D2C, byteArrayOf(9, 9), seq = 0, mtu = 247)
+            .forEach { peripheral.notify(session.callback, peripheral.tx, it) }
+        runCurrent()
+
+        assertEquals(Message(MessageType.OTA_D2C, byteArrayOf(9, 9)), received.await())
     }
 }

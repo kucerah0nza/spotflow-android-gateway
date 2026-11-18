@@ -105,7 +105,7 @@ class FrameCodecTest {
 
     @Test
     fun `types the reassembler does not accept are dropped from their first fragment`() {
-        val reassembler = FrameCodec.Reassembler { it.isRelayed }
+        val reassembler = FrameCodec.Reassembler { it == MessageType.TELEMETRY || it == MessageType.REPORTED_CONFIGURATION }
         val ota = FrameCodec.fragment(MessageType.OTA_D2C, Random(5).nextBytes(60), seq = 1, mtu = 30)
         val artifact = FrameCodec.fragment(MessageType.ARTIFACT_REQUEST, Random(6).nextBytes(20), seq = 1, mtu = 30)
         (ota + artifact).forEach { assertNull(reassembler.onFragment(it)) }
@@ -220,6 +220,29 @@ class FrameCodecTest {
         // Feeding the remaining continuations now has no first fragment to attach to.
         for (i in 1 until frames.size) {
             assertNull(reassembler.onFragment(frames[i]))
+        }
+    }
+
+    @Test
+    fun `needsAck sets NEEDS_ACK in every fragment, and only it`() {
+        val frames = FrameCodec.fragment(MessageType.OTA_C2D, Random(8).nextBytes(100), seq = 9, mtu = 30, needsAck = true)
+        assertTrue(frames.size > 2)
+        frames.forEach { assertEquals(FrameCodec.FLAG_NEEDS_ACK, it[1].toInt() and FrameCodec.FLAG_NEEDS_ACK) }
+        FrameCodec.fragment(MessageType.DESIRED_CONFIGURATION, Random(8).nextBytes(100), seq = 9, mtu = 30)
+            .forEach { assertEquals(0, it[1].toInt() and FrameCodec.FLAG_NEEDS_ACK) }
+    }
+
+    @Test
+    fun `the gateway reassembles what devices send, OTA included, and nothing it sends itself`() {
+        val reassembler = FrameCodec.Reassembler { it.isFromDevice }
+        for (type in listOf(MessageType.OTA_D2C, MessageType.ARTIFACT_REQUEST, MessageType.TELEMETRY)) {
+            val payload = Random(type.value).nextBytes(50)
+            val out = FrameCodec.fragment(type, payload, seq = 2, mtu = 30).map { reassembler.onFragment(it) }.last()
+            assertEquals(type, out?.type)
+            assertArrayEquals(payload, out?.payload)
+        }
+        for (type in listOf(MessageType.OTA_C2D, MessageType.ARTIFACT_RESPONSE, MessageType.DESIRED_CONFIGURATION)) {
+            FrameCodec.fragment(type, Random(1).nextBytes(50), seq = 2, mtu = 30).forEach { assertNull(reassembler.onFragment(it)) }
         }
     }
 }

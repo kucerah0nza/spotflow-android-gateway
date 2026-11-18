@@ -258,4 +258,61 @@ class MqttUplinkBrokerTest {
         assertTrue("expected MqttConnectException but was $error", error is MqttConnectException)
         assertFalse(uplink.isConnected)
     }
+
+    @Test
+    fun `OTA commands are subscribed to on request, and reach their own handler`() = runBlocking {
+        val command = "ota-cbor-c2d/workspace/dev" to byteArrayOf(5, 5)
+        ScriptedBroker(publishOnSubscribeTo = mapOf("ota-cbor-c2d" to command)).use { broker ->
+            val uplink = uplink(broker)
+            val commands = CopyOnWriteArrayList<Pair<ByteArray, () -> Unit>>()
+            var desired = 0
+            uplink.otaCommandHandler = { payload, ack -> commands += payload to ack }
+            uplink.desiredConfigurationHandler = { _, _ -> desired++ }
+
+            uplink.connect()
+            assertFalse(uplink.isOtaSubscribed)
+            uplink.subscribeOta()
+            assertTrue(uplink.isOtaSubscribed)
+            assertEquals(listOf("c1:+config-cbor-c2d", "c1:+ota-cbor-c2d"), broker.subscriptions.toList())
+
+            eventually("the command arrives") { commands.size == 1 }
+            assertTrue(commands[0].first.contentEquals(byteArrayOf(5, 5)))
+            assertEquals(0, desired)
+            delay(200)
+            assertFalse("not acknowledged before the device has it", broker.has("c1:PUBACK"))
+            commands[0].second()
+            eventually("the acknowledgement reaches the broker") { broker.has("c1:PUBACK") }
+
+            // A new connection starts unsubscribed; the broker may still hold the old subscription.
+            uplink.disconnect()
+            uplink.connect()
+            assertFalse(uplink.isOtaSubscribed)
+            assertTrue(uplink.mayHoldOtaSubscription)
+            uplink.unsubscribeOta()
+            assertFalse(uplink.mayHoldOtaSubscription)
+            assertEquals("c2:-ota-cbor-c2d", broker.subscriptions.last())
+            uplink.disconnect()
+        }
+    }
+
+    @Test
+    fun `a refused OTA subscription fails, and leaves the connection up`() = runBlocking {
+        ScriptedBroker(subAckReason = { if (it == "ota-cbor-c2d") 0x87 else 0 }).use { broker ->
+            val uplink = uplink(broker)
+            uplink.connect()
+
+            assertTrue(runCatching { uplink.subscribeOta() }.isFailure)
+            assertFalse(uplink.isOtaSubscribed)
+            assertTrue(uplink.isConnected)
+            uplink.disconnect()
+        }
+    }
+
+    @Test
+    fun `subscribing to OTA commands without a connection fails at once`() = runBlocking {
+        ScriptedBroker().use { broker ->
+            val error = runCatching { uplink(broker).subscribeOta() }.exceptionOrNull()
+            assertTrue("$error", error is UplinkDisconnectedException)
+        }
+    }
 }

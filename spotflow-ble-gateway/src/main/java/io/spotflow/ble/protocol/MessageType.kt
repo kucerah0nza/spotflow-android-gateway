@@ -8,10 +8,10 @@ package io.spotflow.ble.protocol
  *  - [TELEMETRY] and [REPORTED_CONFIGURATION] arrive on the TX Stream (device -> gateway) and are relayed.
  *  - [DESIRED_CONFIGURATION] is sent on the RX Stream (gateway -> device).
  *  - [ACK]/[NACK] are unfragmented 3-byte control frames (`type, acknowledged type, acknowledged seq`)
- *    answering a message sent with [FrameCodec.FLAG_NEEDS_ACK]. The gateway sends no such message, so it
- *    receives none; any that arrive are ignored.
- *  - [OTA_D2C], [OTA_C2D], [ARTIFACT_REQUEST] and [ARTIFACT_RESPONSE] carry over-the-air updates, which
- *    this gateway does not relay yet: what a device sends of them is dropped (see [isRelayed]).
+ *    with which the device answers a message sent with [FrameCodec.FLAG_NEEDS_ACK] — an [OTA_C2D].
+ *  - [OTA_C2D] carries OTA commands to the device, [OTA_D2C] its update results back.
+ *  - [ARTIFACT_REQUEST] (device) and [ARTIFACT_RESPONSE] (gateway) carry an OTA artifact's transfer; see
+ *    [ArtifactProtocol].
  */
 internal enum class MessageType(val value: Int) {
     ACK(0x00),
@@ -27,8 +27,9 @@ internal enum class MessageType(val value: Int) {
     /** Whether this is an unfragmented ACK/NACK control frame rather than a framed message. */
     val isControl: Boolean get() = this == ACK || this == NACK
 
-    /** Whether the gateway relays this type when a device sends it on the TX Stream. */
-    val isRelayed: Boolean get() = this == TELEMETRY || this == REPORTED_CONFIGURATION
+    /** Whether a device sends this type, on the TX Stream (control frames aside). */
+    val isFromDevice: Boolean
+        get() = this == TELEMETRY || this == REPORTED_CONFIGURATION || this == OTA_D2C || this == ARTIFACT_REQUEST
 
     companion object {
         fun fromValue(value: Int): MessageType? = entries.firstOrNull { it.value == value }

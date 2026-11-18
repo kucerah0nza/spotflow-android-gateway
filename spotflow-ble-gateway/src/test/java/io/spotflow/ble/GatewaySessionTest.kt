@@ -9,6 +9,7 @@ import io.spotflow.ble.cloud.MessageStore
 import io.spotflow.ble.cloud.Uplink
 import io.spotflow.ble.cloud.UplinkDisconnectedException
 import io.spotflow.ble.cloud.UplinkThrottledException
+import io.spotflow.ble.ota.ArtifactCache
 import io.spotflow.ble.protocol.DeviceCapabilities
 import io.spotflow.ble.protocol.Message
 import io.spotflow.ble.protocol.MessageType
@@ -31,6 +32,7 @@ import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -39,6 +41,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import java.io.File
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
@@ -80,6 +83,7 @@ class GatewaySessionTest {
         links: CloudLinkRegistry = registry(backgroundScope, uplink),
         filter: DeviceFilter = DeviceFilter.AcceptAll,
         rssiWanted: StateFlow<Boolean>? = null,
+        artifacts: ArtifactCache? = null,
         onStatus: (GatewayDeviceState) -> Unit = {},
     ): GatewaySession {
         val address = ble.deviceAddress
@@ -89,7 +93,177 @@ class GatewaySessionTest {
             }
             onStatus(state)
         }
-        return GatewaySession(ble, config, links, push, filter, rssiWanted)
+        return GatewaySession(ble, config, links, push, filter, rssiWanted, artifacts)
+    }
+
+    // ---- OTA -----------------------------------------------------------------------------------------
+
+    private val otaDevice get() = FakeBleConnection().apply { capabilities = DeviceCapabilities(1, 1, 0x01) }
+
+    /** Serves 1000 bytes of firmware for any URL. */
+    private fun TestScope.artifacts() = ArtifactCache(
+        { File(context.cacheDir, "ota-test") },
+        { _, _, _, target -> target.writeBytes(ByteArray(1000) { it.toByte() }); 1000L },
+        maxArtifactBytes = 1_000_000,
+        scope = backgroundScope,
+    )
+
+    private fun TestScope.otaSession(ble: FakeBleConnection, uplink: FakeUplink, links: CloudLinkRegistry = registry(backgroundScope, uplink), onStatus: (GatewayDeviceState) -> Unit = {}) =
+        launch { runCatching { session(ble, uplink, links, artifacts = artifacts(), onStatus = onStatus).run() } }
+
+    @Test
+    fun `an OTA device's OTA commands are subscribed to once its session metadata is out`() = runTest {
+        val ble = otaDevice
+        val uplink = FakeUplink()
+        var status: GatewayDeviceState? = null
+        val job = otaSession(ble, uplink) { status = it }
+        runCurrent()
+
+        val (call, publishedBefore) = uplink.otaSubscriptionCalls.single()
+        assertEquals("subscribe", call)
+        assertTrue("after the metadata", publishedBefore >= 1)
+        assertArrayEquals("meta".toByteArray(), uplink.published.first().second)
+        assertTrue(status!!.otaEnabled)
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `OTA results go to their topic`() = runTest {
+        val ble = otaDevice
+        val uplink = FakeUplink()
+        val job = otaSession(ble, uplink)
+        runCurrent()
+
+        ble.emit(Message(MessageType.OTA_D2C, byteArrayOf(0x55)))
+        runCurrent()
+
+        assertTrue(uplink.publishedTo("ota-cbor-d2c", byteArrayOf(0x55)))
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `a device without OTA, or a gateway with OTA off, gets no OTA at all`() = runTest {
+        for ((ble, cache) in listOf(FakeBleConnection() to artifacts(), otaDevice to null)) {
+            val uplink = FakeUplink()
+            var status: GatewayDeviceState? = null
+            val job = launch { runCatching { session(ble, uplink, artifacts = cache) { status = it }.run() } }
+            runCurrent()
+
+            ble.emit(Message(MessageType.OTA_D2C, byteArrayOf(0x55)))
+            ble.emit(Message(MessageType.ARTIFACT_REQUEST, ByteArray(15)))
+            runCurrent()
+
+            assertTrue(uplink.otaSubscriptionCalls.isEmpty())
+            assertFalse(uplink.published.any { it.first == "ota-cbor-d2c" })
+            assertTrue(ble.sentArtifactResponses.isEmpty())
+            assertFalse(status!!.otaEnabled)
+            ble.drop(); runCurrent(); job.cancel()
+        }
+    }
+
+    @Test
+    fun `an OTA command is acknowledged to the broker only once the device has acknowledged it`() = runTest {
+        val ble = otaDevice.apply { otaAck = CompletableDeferred() }
+        val uplink = FakeUplink()
+        val job = otaSession(ble, uplink)
+        runCurrent()
+
+        val acks = mutableListOf<Int>()
+        uplink.otaCommandHandler!!(byteArrayOf(1)) { acks += 1 }
+        uplink.otaCommandHandler!!(byteArrayOf(1)) { acks += 11 } // the broker's redelivery
+        uplink.otaCommandHandler!!(byteArrayOf(2)) { acks += 2 }
+        runCurrent()
+        assertTrue(acks.isEmpty())
+
+        ble.otaAck!!.complete(Unit); runCurrent()
+        assertEquals(listOf(listOf<Byte>(1), listOf<Byte>(2)), ble.sentOtaCommands.map { it.toList() })
+        assertEquals(listOf(1, 11, 2), acks)
+        ble.drop(); runCurrent(); job.cancel()
+    }
+
+    @Test
+    fun `an OTA command not acknowledged by the device waits for its next session`() = runTest {
+        val uplink = FakeUplink()
+        val links = registry(backgroundScope, uplink)
+        val first = otaDevice.apply { otaAck = CompletableDeferred() }
+        val job1 = otaSession(first, uplink, links)
+        runCurrent()
+        var acked = false
+        uplink.otaCommandHandler!!(byteArrayOf(3)) { acked = true }
+        runCurrent()
+        first.otaAck!!.completeExceptionally(java.io.IOException("link lost"))
+        first.drop(); runCurrent(); job1.cancel()
+        assertFalse(acked)
+
+        val second = otaDevice
+        val job2 = otaSession(second, uplink, links)
+        runCurrent()
+        assertEquals(listOf<Byte>(3), second.sentOtaCommands.single().toList())
+        assertTrue(acked)
+        second.drop(); runCurrent(); job2.cancel()
+    }
+
+    @Test
+    fun `every OTA session subscribes again, so the cloud replays an unfinished update`() = runTest {
+        val uplink = FakeUplink()
+        val links = registry(backgroundScope, uplink)
+        val first = otaDevice
+        val job1 = otaSession(first, uplink, links)
+        runCurrent()
+        first.drop(); runCurrent(); job1.cancel()
+        // The device rebooted; the link (and its MQTT connection) outlived the BLE session.
+        val second = otaDevice
+        val job2 = otaSession(second, uplink, links)
+        runCurrent()
+        uplink.loseConnection()
+        advanceTimeBy(60_000); runCurrent()
+
+        assertEquals(2, uplink.connectCount)
+        assertEquals("both sessions, and the new connection", 3, uplink.otaSubscriptionCalls.count { it.first == "subscribe" })
+        second.drop(); runCurrent(); job2.cancel()
+    }
+
+    @Test
+    fun `a device that no longer takes OTA updates is unsubscribed`() = runTest {
+        val uplink = FakeUplink()
+        val links = registry(backgroundScope, uplink)
+        val first = otaDevice
+        val job1 = otaSession(first, uplink, links)
+        runCurrent()
+        first.drop(); runCurrent(); job1.cancel()
+
+        val reflashed = FakeBleConnection()
+        val job2 = otaSession(reflashed, uplink, links)
+        runCurrent()
+
+        assertEquals(listOf("subscribe", "unsubscribe"), uplink.otaSubscriptionCalls.map { it.first })
+        reflashed.drop(); runCurrent(); job2.cancel()
+    }
+
+    @Test
+    fun `artifact requests are answered over BLE, with the transfer shown in the device's status`() = runTest {
+        val ble = otaDevice
+        val uplink = FakeUplink()
+        var status: GatewayDeviceState? = null
+        val job = otaSession(ble, uplink) { status = it }
+        runCurrent()
+
+        val url = "https://x".toByteArray()
+        val open = java.nio.ByteBuffer.allocate(12 + url.size + 1).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .put(1).putInt(5).putInt(1).putShort(url.size.toShort()).put(1).put(url).put('s'.code.toByte()).array()
+        ble.emit(Message(MessageType.ARTIFACT_REQUEST, open))
+        runCurrent()
+        val read = java.nio.ByteBuffer.allocate(15).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .put(2).putInt(5).putInt(2).putInt(0).putShort(512).array()
+        ble.emit(Message(MessageType.ARTIFACT_REQUEST, read))
+        runCurrent()
+
+        assertEquals(listOf(0x81, 0x82), ble.sentArtifactResponses.map { it[0].toInt() and 0xFF })
+        assertEquals(OtaTransfer(1000, 512), status!!.otaTransfer)
+        assertFalse("nothing of it goes to the cloud", uplink.published.any { it.second.contentEquals(open) })
+
+        ble.drop(); runCurrent(); job.cancel()
+        assertNull(status!!.otaTransfer)
     }
 
     @Test
@@ -817,7 +991,8 @@ internal class FakeBleConnection(
         operations += "prepare"
         stateFlow.value = ConnectionState.PREPARING
     }
-    override suspend fun readCapabilities() = DeviceCapabilities(1, 1, 0).also { operations += "capabilities" }
+    var capabilities = DeviceCapabilities(1, 1, 0)
+    override suspend fun readCapabilities() = capabilities.also { operations += "capabilities" }
     /** Like the Device SDK: once notifications are on, the device sends its reported configuration. */
     var reportsConfiguration = true
     override suspend fun startStreaming() {
@@ -838,6 +1013,19 @@ internal class FakeBleConnection(
         }
         sentDesiredConfig += payload
     }
+
+    /** OTA commands the device has acknowledged, in order. */
+    val sentOtaCommands = mutableListOf<ByteArray>()
+
+    /** While set, an OTA command waits for the device's ACK until this completes (or throws with it). */
+    var otaAck: CompletableDeferred<Unit>? = null
+    override suspend fun sendOtaCommand(payload: ByteArray) {
+        otaAck?.await()
+        sentOtaCommands += payload
+    }
+
+    val sentArtifactResponses = mutableListOf<ByteArray>()
+    override suspend fun sendArtifactResponse(payload: ByteArray) { sentArtifactResponses += payload }
     override suspend fun close() { closed = true }
 
     fun emit(message: Message) { channel.trySend(message) }
@@ -874,7 +1062,33 @@ internal class FakeUplink : Uplink {
 
     override val isConnected: Boolean get() = connected
     override var desiredConfigurationHandler: ((ByteArray, () -> Unit) -> Unit)? = null
+    override var otaCommandHandler: ((ByteArray, () -> Unit) -> Unit)? = null
     override var onConnectionLost: (() -> Unit)? = null
+
+    override var isOtaSubscribed = false
+    override var mayHoldOtaSubscription = false
+
+    /** "subscribe" / "unsubscribe", each with how many messages had been published before it. */
+    val otaSubscriptionCalls = mutableListOf<Pair<String, Int>>()
+    var failOtaSubscribe = 0
+
+    override suspend fun subscribeOta() {
+        if (!connected) throw UplinkDisconnectedException("not connected", rejectedByBroker = false)
+        mayHoldOtaSubscription = true
+        if (failOtaSubscribe > 0) {
+            failOtaSubscribe--
+            throw RuntimeException("refused")
+        }
+        otaSubscriptionCalls += "subscribe" to published.size
+        isOtaSubscribed = true
+    }
+
+    override suspend fun unsubscribeOta() {
+        if (!connected) throw UplinkDisconnectedException("not connected", rejectedByBroker = false)
+        otaSubscriptionCalls += "unsubscribe" to published.size
+        isOtaSubscribed = false
+        mayHoldOtaSubscription = false
+    }
 
     /** While set, connect() does not return — not even when cancelled — until it completes. */
     var connectGate: CompletableDeferred<Unit>? = null
@@ -892,6 +1106,7 @@ internal class FakeUplink : Uplink {
             if (failConnect) throw RuntimeException("offline")
             connectCount++
             connected = true
+            isOtaSubscribed = false
         } finally {
             connecting--
         }

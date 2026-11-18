@@ -1,5 +1,7 @@
 package io.spotflow.ble
 
+import java.io.File
+import io.spotflow.ble.ota.ArtifactCache
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
@@ -61,12 +63,14 @@ public class SpotflowGateway internal constructor(
     private val requestedMtu: Int,
     private val platform: GatewayPlatform,
     dispatcher: CoroutineDispatcher,
+    otaConfig: OtaConfig = OtaConfig(),
 ) {
     /**
      * @param deviceFilter decides which devices are relayed. It is required because the choice matters:
      *   the BLE protocol does not authenticate devices, so production integrations should accept only the
      *   devices they expect. Pass [DeviceFilter.AcceptAll] to relay everything in range.
      * @param requestedMtu the ATT MTU to ask for; the device may settle for less.
+     * @param otaConfig over-the-air updates of devices that support them; on by default.
      */
     public constructor(
         context: Context,
@@ -74,6 +78,7 @@ public class SpotflowGateway internal constructor(
         deviceFilter: DeviceFilter,
         mqttConfig: MqttConfig = MqttConfig(),
         requestedMtu: Int = DEFAULT_MTU,
+        otaConfig: OtaConfig = OtaConfig(),
     ) : this(
         context,
         mqttConfig,
@@ -81,6 +86,7 @@ public class SpotflowGateway internal constructor(
         requestedMtu,
         AndroidGatewayPlatform(context.applicationContext, credentials, mqttConfig, requestedMtu),
         Dispatchers.IO,
+        otaConfig,
     )
 
     // Application context only: the gateway may outlive whatever component created it.
@@ -107,6 +113,11 @@ public class SpotflowGateway internal constructor(
 
     /** Live usage of the store-and-forward budget, across all devices (see [MqttConfig.bufferMaxBytes]). */
     public val bufferUsage: StateFlow<BufferUsage> get() = buffers.usage
+
+    /** OTA artifacts downloaded for the devices, shared by all of them; null with OTA off. */
+    private val artifacts: ArtifactCache? = otaConfig.takeIf { it.enabled }?.let {
+        ArtifactCache({ File(appContext.cacheDir, "spotflow-ota") }, platform.artifactDownloader, it.maxArtifactBytes, scope)
+    }
 
     private val links = CloudLinkRegistry(scope) { deviceId, push ->
         CloudLink(deviceId, buffers.open(deviceId), platform.createUplink(deviceId), push, platform.online)
@@ -277,7 +288,7 @@ public class SpotflowGateway internal constructor(
                 val connection = device.connect(!direct)
                 var cleanEnd = false
                 try {
-                    GatewaySession(connection, mqttConfig, links, statusOf(address), deviceFilter, rssiWanted).run()
+                    GatewaySession(connection, mqttConfig, links, statusOf(address), deviceFilter, rssiWanted, artifacts).run()
                     cleanEnd = true
                     backoff = INITIAL_BACKOFF_MS
                     authBackoff = AUTH_RETRY_INITIAL_MS
@@ -369,6 +380,7 @@ public class SpotflowGateway internal constructor(
             try {
                 GatewaySession(
                     connection, mqttConfig, links, statusOf(address), deviceFilter, rssiWanted.takeIf { pollRssi },
+                    artifacts,
                 ).run()
             } catch (c: CancellationException) {
                 throw c // normal teardown — not an error
@@ -407,6 +419,7 @@ public class SpotflowGateway internal constructor(
         jobs.values.forEach { it.cancel() }
         jobs.clear()
         scope.cancel()
+        artifacts?.clear()
         // The flash store closes once every link has flushed and closed its buffer.
         buffers.shutdown()
     }

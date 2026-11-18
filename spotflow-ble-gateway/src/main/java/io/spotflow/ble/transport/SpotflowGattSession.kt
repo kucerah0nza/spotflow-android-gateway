@@ -15,6 +15,7 @@ import io.spotflow.ble.protocol.Message
 import io.spotflow.ble.protocol.MessageType
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -24,6 +25,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * The shared GATT engine used by both [ManagedBleConnection] and [AttachedBleConnection]. One session
@@ -61,6 +63,11 @@ internal class SpotflowGattSession(
          */
         private const val MIN_SUPERVISION_TIMEOUT = 200
         private const val MAX_PRIORITY_REQUESTS = 3
+
+        /** How long to wait for an ACK/NACK, and the backoff between retransmissions. */
+        internal const val ACK_TIMEOUT_MS = 5_000L
+        private const val ACK_RETRY_INITIAL_MS = 1_000L
+        private const val ACK_RETRY_MAX_MS = 30_000L
 
         /** `GATT_AUTH_FAIL`: pairing failed or was declined (not in the public SDK). */
         private const val GATT_AUTH_FAIL = 0x89
@@ -104,8 +111,16 @@ internal class SpotflowGattSession(
     var mtu: Int = FrameCodec.MIN_MTU
         private set
 
-    // Only what the gateway relays: OTA messages of an OTA-capable device are dropped on arrival.
-    private val reassembler = FrameCodec.Reassembler { it.isRelayed }
+    // Only what a device sends: anything else on the TX Stream is dropped on arrival.
+    private val reassembler = FrameCodec.Reassembler { it.isFromDevice }
+
+    /** A message sent with NEEDS_ACK, waiting for the device's ACK (true) or NACK (false). */
+    private class PendingAck(val seq: Int) {
+        val result = CompletableDeferred<Boolean>()
+    }
+
+    /** Keyed by message type: the protocol allows one unacknowledged message per type. */
+    private val pendingAcks = ConcurrentHashMap<Int, PendingAck>()
 
     // Serializes GATT operations. Only one operation is in flight, so a single pending slot suffices.
     private val opLock = Mutex()
@@ -124,7 +139,11 @@ internal class SpotflowGattSession(
     @Volatile private var gatt: BluetoothGatt? = null
     @Volatile private var closed = false
     @Volatile private var priorityRequests = 0
-    private var txSeq = 0
+
+    /** Sequence number of the next message, per type: (type, seq) identifies a message. */
+    private val txSeq = IntArray(256)
+
+    private fun nextSeq(type: MessageType): Int = synchronized(txSeq) { txSeq[type.value]++ and 0xFF }
 
     fun attachGatt(gatt: BluetoothGatt) {
         this.gatt = gatt
@@ -261,6 +280,17 @@ internal class SpotflowGattSession(
 
     private fun onNotification(characteristic: BluetoothGattCharacteristic, value: ByteArray) {
         if (characteristic.uuid != GattProfile.TX_STREAM) return
+        val type = value.firstOrNull()?.toInt()?.and(0xFF)
+        if (type == MessageType.ACK.value || type == MessageType.NACK.value) {
+            // [type, acknowledged type, acknowledged seq]: completes the message waiting for it, if any.
+            if (value.size >= 3) {
+                val pending = pendingAcks[value[1].toInt() and 0xFF]
+                if (pending != null && pending.seq == (value[2].toInt() and 0xFF)) {
+                    pending.result.complete(type == MessageType.ACK.value)
+                }
+            }
+            return
+        }
         val message = reassembler.onFragment(value) ?: return
         if (message.payload.size >= LARGE_MESSAGE_BYTES) {
             // Large TELEMETRY messages are typically coredump chunks; log to aid diagnosis.
@@ -290,6 +320,7 @@ internal class SpotflowGattSession(
     private fun failAllPending(cause: Throwable) {
         listOf(pendingConnect, pendingDiscover, pendingRead?.result, pendingWrite?.result, pendingDescriptor?.result, pendingRssi)
             .forEach { it?.completeExceptionally(cause) }
+        pendingAcks.values.forEach { it.result.completeExceptionally(cause) }
         pendingMtu?.complete(FrameCodec.MIN_MTU)
     }
 
@@ -464,12 +495,44 @@ internal class SpotflowGattSession(
         }
     }
 
+    /** Fragments and writes one message of [type] to the RX Stream (best effort: no acknowledgement). */
+    suspend fun writeMessage(type: MessageType, payload: ByteArray) {
+        val frames = FrameCodec.fragment(type, payload, nextSeq(type), mtu)
+        writeFrames(frames)
+    }
+
+    /**
+     * Writes one message of [type] with NEEDS_ACK and suspends until the device acknowledges it. A NACK or
+     * no answer within [ACK_TIMEOUT_MS] retransmits the complete message, with the same sequence number,
+     * after a backoff — for as long as the link is up. Throws once it is not.
+     */
+    suspend fun writeAcknowledged(type: MessageType, payload: ByteArray) {
+        val seq = nextSeq(type)
+        val frames = FrameCodec.fragment(type, payload, seq, mtu, needsAck = true)
+        var backoff = ACK_RETRY_INITIAL_MS
+        while (true) {
+            val pending = PendingAck(seq)
+            // Armed before the write, so a quick answer can't slip past.
+            pendingAcks[type.value] = pending
+            try {
+                writeFrames(frames)
+                when (withTimeoutOrNull(ACK_TIMEOUT_MS) { pending.result.await() }) {
+                    true -> return
+                    false -> Slog.d(TAG, "device refused $type #$seq (NACK); retransmitting")
+                    null -> Slog.d(TAG, "no acknowledgement of $type #$seq; retransmitting")
+                }
+            } finally {
+                pendingAcks.remove(type.value, pending)
+            }
+            delay(backoff)
+            backoff = (backoff * 2).coerceAtMost(ACK_RETRY_MAX_MS)
+        }
+    }
+
     @SuppressLint("MissingPermission")
-    suspend fun writeDesiredConfiguration(payload: ByteArray) = opLock.withLock {
+    private suspend fun writeFrames(frames: List<ByteArray>) = opLock.withLock {
         val g = requireGatt()
         val rx = characteristic(g, GattProfile.RX_STREAM)
-        val seq = txSeq++ and 0xFF
-        val frames = FrameCodec.fragment(MessageType.DESIRED_CONFIGURATION, payload, seq, mtu)
         for (frame in frames) {
             writeNoResponse(g, rx, frame)
         }
