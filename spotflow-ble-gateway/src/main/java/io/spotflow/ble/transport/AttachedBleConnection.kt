@@ -4,6 +4,7 @@ import android.bluetooth.BluetoothGatt
 import io.spotflow.ble.protocol.DeviceCapabilities
 import io.spotflow.ble.protocol.GattProfile
 import io.spotflow.ble.protocol.Message
+import io.spotflow.ble.protocol.MessageType
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -47,7 +48,13 @@ internal class AttachedBleConnection(
     override suspend fun readRssi(): Int = session.readRssi()
 
     override suspend fun sendDesiredConfiguration(payload: ByteArray) =
-        session.writeDesiredConfiguration(payload)
+        session.writeMessage(MessageType.DESIRED_CONFIGURATION, payload)
+
+    override suspend fun sendOtaCommand(payload: ByteArray) =
+        session.writeAcknowledged(MessageType.OTA_C2D, payload)
+
+    override suspend fun sendArtifactResponse(payload: ByteArray) =
+        session.writeMessage(MessageType.ARTIFACT_RESPONSE, payload)
 
     override suspend fun close() {
         // The host's link stays up after us: without this the device would keep streaming to nobody.

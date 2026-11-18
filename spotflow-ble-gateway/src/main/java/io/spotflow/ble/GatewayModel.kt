@@ -29,6 +29,36 @@ public data class GatewayDeviceState(
     val diskBytes: Long = 0,
     /** What currently keeps this device from being relayed, if anything. */
     val error: DeviceError? = null,
+    /**
+     * Whether the device takes OTA updates through this gateway: its Capabilities advertise them and the
+     * gateway's [OtaConfig.enabled] is on. Known once the device has been read.
+     */
+    val otaEnabled: Boolean = false,
+    /** The OTA artifact being transferred to the device, if any. */
+    val otaTransfer: OtaTransfer? = null,
+)
+
+/** An OTA artifact on its way to a device through the gateway; see [GatewayDeviceState.otaTransfer]. */
+public data class OtaTransfer(
+    /** The artifact's size, or null while the gateway is still downloading it. */
+    val sizeBytes: Long?,
+    /** How much of it the device has read. */
+    val deliveredBytes: Long,
+)
+
+/**
+ * Over-the-air updates through the gateway (Spotflow BLE protocol 1.1). The gateway forwards a device's OTA
+ * commands and results, and downloads its firmware over HTTPS on its behalf.
+ *
+ * The gateway is part of the update's trust boundary: it holds the artifacts' download credentials while
+ * it serves them, and decides what bytes reach the device. Firmware signatures are still checked on the
+ * device (by its bootloader or update handler).
+ */
+public data class OtaConfig(
+    /** Whether to relay OTA updates. Off, OTA-capable devices are relayed for telemetry and configuration. */
+    val enabled: Boolean = true,
+    /** Largest artifact the gateway downloads; a device asking for a larger one is told it is too large. */
+    val maxArtifactBytes: Long = 32L * 1024 * 1024,
 )
 
 /** Why a device is not (fully) relayed at the moment. */

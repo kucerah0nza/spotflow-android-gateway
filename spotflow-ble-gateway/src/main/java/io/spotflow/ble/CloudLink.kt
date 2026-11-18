@@ -61,24 +61,30 @@ internal class CloudLink(
     @Volatile var authRejected = false
         private set
 
-    private class PendingDesired(val payload: ByteArray, ack: () -> Unit) {
-        /** One per delivery by the broker: it sends an unacknowledged message again on every reconnect. */
-        val acks = arrayListOf(ack)
-        var failures = 0
-    }
-
-    // Desired configuration waits here (in arrival order, unacknowledged) until a BLE session writes it.
-    private val desiredLock = Any()
-    private val pendingDesired = ArrayDeque<PendingDesired>()
-    private val desiredSignal = Channel<Unit>(Channel.CONFLATED)
+    // Desired configuration and OTA commands wait here until a BLE session writes them to the device.
+    private val desired = InboundQueue()
+    private val otaCommands = InboundQueue()
 
     /**
      * The last desired configuration written to the device. The broker sends the current desired
      * configuration only when an MQTT connection is established — a device on MQTT directly gets it again
      * after every reboot, since it reconnects. This link outlives BLE sessions, so a rebooted device
-     * (which starts from its compiled defaults) would otherwise never get it back. Guarded by [desiredLock].
+     * (which starts from its compiled defaults) would otherwise never get it back.
      */
-    private var lastWrittenDesired: ByteArray? = null
+    @Volatile private var lastWrittenDesired: ByteArray? = null
+
+    /**
+     * Whether the device takes OTA updates, as its last BLE session found: the link then subscribes to its
+     * OTA commands, on every connection (see [syncOtaSubscription]).
+     */
+    @Volatile private var otaWanted = false
+
+    /**
+     * Set by every BLE session of a device taking OTA updates: subscribe again even on a connection that is
+     * subscribed already. The cloud replays an unfinished update on a subscription only, and a device that
+     * rebooted (its MQTT connection, held by this link, did not) restarts an unfinished artifact only then.
+     */
+    @Volatile private var otaResubscribe = false
 
     // Session metadata (build ID, run ID, ...) gives the cloud the context of the device's telemetry, but
     // only for the MQTT connection it was published on: after a reconnect it must be published again
@@ -94,25 +100,8 @@ internal class CloudLink(
     init {
         // Another device's data can push this device's out of RAM (to flash) or out of flash (evicted).
         buffer.onExternalChange = { pushBuffer() }
-        uplink.desiredConfigurationHandler = { payload, ack ->
-            // The same configuration again — what the broker does on every reconnect while a message is
-            // unacknowledged — joins the one already waiting instead of queueing up behind it.
-            val queued = synchronized(desiredLock) {
-                val last = pendingDesired.lastOrNull()
-                if (last != null && last.payload.contentEquals(payload)) {
-                    last.acks += ack
-                    null
-                } else {
-                    pendingDesired.addLast(PendingDesired(payload, ack))
-                    pendingDesired.size
-                }
-            }
-            if (queued != null) {
-                Slog.d(TAG, "desired configuration for $deviceId received (${payload.size} bytes, $queued pending)")
-                push { it.copy(received = it.received + 1) }
-            }
-            desiredSignal.trySend(Unit)
-        }
+        uplink.desiredConfigurationHandler = { payload, ack -> receive(desired, "desired configuration", payload, ack) }
+        uplink.otaCommandHandler = { payload, ack -> receive(otaCommands, "OTA command", payload, ack) }
         // Report a lost connection as it happens and wake an idle drain loop to reconnect, rather than
         // leaving the status "connected" until the next message or poll.
         uplink.onConnectionLost = {
@@ -122,6 +111,22 @@ internal class CloudLink(
     }
 
     val isEmpty: Boolean get() = buffer.isEmpty
+
+    private fun receive(queue: InboundQueue, kind: String, payload: ByteArray, ack: () -> Unit) {
+        val queued = queue.offer(payload, ack) ?: return
+        Slog.d(TAG, "$kind for $deviceId received (${payload.size} bytes, $queued pending)")
+        push { it.copy(received = it.received + 1) }
+    }
+
+    /**
+     * Sets whether the device takes OTA updates. The drain loop then subscribes to (or unsubscribes from)
+     * its OTA commands — after the device's session metadata is out, the order the Device SDK follows on MQTT.
+     */
+    fun setOtaEnabled(enabled: Boolean) {
+        otaWanted = enabled
+        otaResubscribe = enabled
+        drainSignal.trySend(Unit)
+    }
 
     /** Buffers a message for upload (RAM first; never blocks on the network). */
     fun enqueue(topic: String, payload: ByteArray) {
@@ -190,6 +195,8 @@ internal class CloudLink(
         // Set by every new connection: the session metadata in effect has to be published on it first.
         var restoreContext = false
         var restoreFailures = 0
+        // Set when the broker refused the OTA subscription: not asked again on the same connection.
+        var otaRefused = false
         while (true) {
             if (!uplink.isConnected) {
                 if (!online.value) {
@@ -203,6 +210,7 @@ internal class CloudLink(
                     push { it.copy(cloudConnected = true, error = it.error?.takeUnless { error -> isCloudError(error) }) }
                     backoff = INITIAL_BACKOFF_MS
                     restoreContext = true
+                    otaRefused = false
                 } catch (c: CancellationException) {
                     throw c
                 } catch (auth: MqttAuthException) {
@@ -243,6 +251,17 @@ internal class CloudLink(
                 }
                 restoreContext = false
                 restoreFailures = 0
+            }
+
+            if (!otaRefused && !syncOtaSubscription()) {
+                if (uplink.isConnected) {
+                    otaRefused = true
+                } else {
+                    push { it.copy(cloudConnected = false) }
+                    awaitRetry(backoff)
+                    backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
+                    continue
+                }
             }
 
             val batch = buffer.peek(window, MAX_WINDOW_PAYLOAD_BYTES)
@@ -310,6 +329,43 @@ internal class CloudLink(
             if (!uplink.isConnected) push { it.copy(cloudConnected = false) }
             awaitRetry(backoff)
             backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
+        }
+    }
+
+    /**
+     * Brings the OTA subscription in line with [otaWanted]: subscribes on every connection and for every
+     * BLE session (so the cloud replays an unfinished update, see [otaResubscribe]), and unsubscribes once if the device no longer takes OTA updates (the
+     * broker keeps a subscription across connections). Waits until the session metadata in the buffer is
+     * published. Returns false if that failed.
+     */
+    private suspend fun syncOtaSubscription(): Boolean {
+        val wanted = otaWanted
+        val inLine = if (wanted) uplink.isOtaSubscribed && !otaResubscribe else !uplink.mayHoldOtaSubscription
+        if (inLine || metadataPending()) return true
+        return try {
+            if (wanted) {
+                otaResubscribe = false
+                uplink.subscribeOta()
+            } else {
+                uplink.unsubscribeOta()
+            }
+            Slog.i(TAG, "OTA commands for $deviceId ${if (wanted) "subscribed" else "unsubscribed"}")
+            true
+        } catch (c: CancellationException) {
+            throw c
+        } catch (t: Throwable) {
+            Slog.w(TAG, "OTA subscription for $deviceId failed: ${t.describe()}")
+            false
+        }
+    }
+
+    /** Whether session metadata enqueued by this link is still waiting in the buffer. */
+    private fun metadataPending(): Boolean {
+        val head = buffer.peek().firstOrNull()?.seq
+        synchronized(metadataLock) {
+            // Everything older than the head is gone from the buffer (published, or evicted).
+            if (head == null) metadataSeqs.clear() else metadataSeqs.removeAll { it < head }
+            return metadataSeqs.isNotEmpty()
         }
     }
 
@@ -390,7 +446,7 @@ internal class CloudLink(
      * pending), since the device may have rebooted and lost it — see [lastWrittenDesired].
      */
     suspend fun deliverDesiredConfiguration(write: suspend (ByteArray) -> Unit) {
-        val replay = synchronized(desiredLock) { lastWrittenDesired.takeIf { pendingDesired.isEmpty() } }
+        val replay = lastWrittenDesired.takeIf { desired.isEmpty }
         if (replay != null) {
             try {
                 write(replay)
@@ -402,14 +458,10 @@ internal class CloudLink(
             }
         }
         while (true) {
-            val head = synchronized(desiredLock) { pendingDesired.firstOrNull() }
-            if (head == null) {
-                desiredSignal.receive()
-                continue
-            }
+            val head = desired.next()
             val done = try {
                 write(head.payload)
-                synchronized(desiredLock) { lastWrittenDesired = head.payload }
+                lastWrittenDesired = head.payload
                 Slog.d(TAG, "desired configuration written to $deviceId (${head.payload.size} bytes)")
                 true
             } catch (c: CancellationException) {
@@ -427,14 +479,31 @@ internal class CloudLink(
                     false
                 }
             }
-            if (done) {
-                // Taken out under the lock, so no further delivery can join it after its acks are read.
-                val acks = synchronized(desiredLock) {
-                    pendingDesired.removeFirst()
-                    head.acks.toList()
-                }
-                acks.forEach { it() }
+            if (done) desired.complete(head)
+        }
+    }
+
+    /**
+     * Writes pending OTA commands to the device via [write], in arrival order, acknowledging each to the
+     * broker once the device has acknowledged it ([write] returns only then). Runs until cancelled;
+     * whatever was not delivered stays pending for the next BLE session. Nothing is dropped: the cloud
+     * expects every command to arrive, and the device tolerates duplicates.
+     */
+    suspend fun deliverOtaCommands(write: suspend (ByteArray) -> Unit) {
+        while (true) {
+            val head = otaCommands.next()
+            try {
+                write(head.payload)
+            } catch (c: CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                // The link is going down; the session ends and the command waits for the next one.
+                Slog.w(TAG, "OTA command not delivered to $deviceId: ${t.message}")
+                delay(DESIRED_RETRY_MS)
+                continue
             }
+            Slog.i(TAG, "OTA command delivered to $deviceId (${head.payload.size} bytes)")
+            otaCommands.complete(head)
         }
     }
 
@@ -446,6 +515,7 @@ internal class CloudLink(
         runCatching { buffer.flushToDisk() }
         pushBuffer()
         uplink.desiredConfigurationHandler = null
+        uplink.otaCommandHandler = null
         uplink.onConnectionLost = null
         buffer.onExternalChange = null
         runCatching { uplink.disconnect() }
@@ -499,6 +569,62 @@ internal class CloudLink(
             error.kind == DeviceError.Kind.CLOUD_UNREACHABLE || error.kind == DeviceError.Kind.AUTH_REJECTED
 
         fun Throwable.describe(): String = message ?: javaClass.simpleName
+    }
+}
+
+/**
+ * Messages from the cloud waiting — in arrival order, unacknowledged to the broker — for a BLE session to
+ * write them to the device.
+ */
+private class InboundQueue {
+    class Entry(val payload: ByteArray, ack: () -> Unit) {
+        /** One per delivery by the broker: it sends an unacknowledged message again on every reconnect. */
+        val acks = arrayListOf(ack)
+        var failures = 0
+    }
+
+    private val entries = ArrayDeque<Entry>()
+    private val signal = Channel<Unit>(Channel.CONFLATED)
+
+    val isEmpty: Boolean get() = synchronized(this) { entries.isEmpty() }
+
+    /**
+     * Queues [payload]. The same payload as the last one waiting — what the broker sends on every reconnect
+     * while a message is unacknowledged — joins it instead of queueing up behind it. Returns how many are
+     * waiting, or null if it joined.
+     */
+    fun offer(payload: ByteArray, ack: () -> Unit): Int? {
+        val queued = synchronized(this) {
+            val last = entries.lastOrNull()
+            if (last != null && last.payload.contentEquals(payload)) {
+                last.acks += ack
+                null
+            } else {
+                entries.addLast(Entry(payload, ack))
+                entries.size
+            }
+        }
+        signal.trySend(Unit)
+        return queued
+    }
+
+    /** The oldest message, once there is one. It stays queued until [complete]. */
+    suspend fun next(): Entry {
+        while (true) {
+            synchronized(this) { entries.firstOrNull() }?.let { return it }
+            signal.receive()
+        }
+    }
+
+    /** Takes [entry] (the oldest) out and acknowledges every delivery of it to the broker. */
+    fun complete(entry: Entry) {
+        // Taken out under the lock, so no further delivery can join it after its acks are read.
+        val acks = synchronized(this) {
+            check(entries.firstOrNull() === entry) { "not the oldest message" }
+            entries.removeFirst()
+            entry.acks.toList()
+        }
+        acks.forEach { it() }
     }
 }
 

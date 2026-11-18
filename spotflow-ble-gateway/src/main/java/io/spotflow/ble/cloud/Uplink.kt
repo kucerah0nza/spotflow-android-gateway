@@ -15,8 +15,29 @@ internal interface Uplink {
      */
     var desiredConfigurationHandler: ((payload: ByteArray, ack: () -> Unit) -> Unit)?
 
+    /** Invoked when an OTA command arrives, like [desiredConfigurationHandler]. */
+    var otaCommandHandler: ((payload: ByteArray, ack: () -> Unit) -> Unit)?
+
     /** Invoked, on any thread, when an established connection is lost (not after [disconnect]). */
     var onConnectionLost: (() -> Unit)?
+
+    /** Whether OTA commands are subscribed to on the current connection; false after every [connect]. */
+    val isOtaSubscribed: Boolean
+
+    /**
+     * Whether a subscription to OTA commands may still be held by the broker for this device: one made on
+     * an earlier connection outlives it (persistent session), until [unsubscribeOta].
+     */
+    val mayHoldOtaSubscription: Boolean
+
+    /**
+     * Subscribes to OTA commands on the current connection; the cloud then sends an unfinished update
+     * again. Throws if the connection is lost meanwhile or the broker refuses.
+     */
+    suspend fun subscribeOta()
+
+    /** Ends the subscription to OTA commands. Throws like [subscribeOta]. */
+    suspend fun unsubscribeOta()
 
     /**
      * Connects and subscribes. Throws [MqttAuthException] for a rejected key, else a retryable error.

@@ -25,6 +25,10 @@ internal class ScriptedBroker(
     private val cutOnSubscribe: (connection: Int) -> Boolean = { false },
     /** Sent to the client right after it subscribes: a topic and a payload, as desired configuration is. */
     private val publishOnSubscribe: Pair<String, ByteArray>? = null,
+    /** The SUBACK reason code for a topic filter (0x87 = not authorized). */
+    private val subAckReason: (topicFilter: String) -> Int = { 0 },
+    /** Like [publishOnSubscribe], but only after subscribing to the given topic filter. */
+    private val publishOnSubscribeTo: Map<String, Pair<String, ByteArray>> = emptyMap(),
 ) : AutoCloseable {
 
     /** What the broker does with a PUBLISH it receives. */
@@ -47,6 +51,9 @@ internal class ScriptedBroker(
     private val server = ServerSocket(0)
     val port: Int get() = server.localPort
     val events = CopyOnWriteArrayList<String>()
+
+    /** "c<connection>:+<filter>" per subscription, "c<connection>:-<filter>" per unsubscription. */
+    val subscriptions = CopyOnWriteArrayList<String>()
     private val sockets = CopyOnWriteArrayList<Socket>()
 
     @Volatile private var connections = 0
@@ -100,12 +107,16 @@ internal class ScriptedBroker(
                     }
                     SUBSCRIBE -> {
                         events += "$tag:SUBSCRIBE"
+                        val filter = topicFilter(body)
+                        subscriptions += "$tag:+$filter"
                         if (cutOnSubscribe(connection)) {
                             socket.close()
                             continue
                         }
-                        out.send(0x90, 0x04, body[0].toInt(), body[1].toInt(), 0, 1)
-                        publishOnSubscribe?.let { (topic, payload) ->
+                        val reason = subAckReason(filter)
+                        out.send(0x90, 0x04, body[0].toInt(), body[1].toInt(), 0, if (reason == 0) 1 else reason)
+                        if (reason != 0) continue
+                        (publishOnSubscribeTo[filter] ?: publishOnSubscribe)?.let { (topic, payload) ->
                             val topicBytes = topic.toByteArray()
                             val remaining = 2 + topicBytes.size + 2 + 1 + payload.size
                             check(remaining < 128) { "keep scripted publishes short" }
@@ -134,6 +145,10 @@ internal class ScriptedBroker(
                             }
                         }
                     }
+                    UNSUBSCRIBE -> {
+                        subscriptions += "$tag:-${topicFilter(body)}"
+                        out.send(0xB0, 0x04, body[0].toInt(), body[1].toInt(), 0, 0)
+                    }
                     PUBACK -> events += "$tag:PUBACK"
                     PINGREQ -> out.send(0xD0, 0)
                     DISCONNECT -> {
@@ -147,6 +162,13 @@ internal class ScriptedBroker(
         } catch (_: Exception) {
             events += "$tag:closed"
         }
+    }
+
+    /** The first topic filter of a SUBSCRIBE or UNSUBSCRIBE: after the packet ID and (short) properties. */
+    private fun topicFilter(body: ByteArray): String {
+        val at = 3 + body[2]
+        val length = ((body[at].toInt() and 0xFF) shl 8) or (body[at + 1].toInt() and 0xFF)
+        return String(body, at + 2, length)
     }
 
     private fun OutputStream.send(vararg bytes: Int) {
@@ -164,6 +186,7 @@ internal class ScriptedBroker(
         const val PUBLISH = 3
         const val PUBACK = 4
         const val SUBSCRIBE = 8
+        const val UNSUBSCRIBE = 10
         const val PINGREQ = 12
         const val DISCONNECT = 14
     }

@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+Over-the-air firmware updates through the gateway (Spotflow BLE protocol 1.1).
+
+### Added
+
+- **OTA updates** for devices whose Capabilities advertise them, on by default. The gateway subscribes to
+  the device's OTA commands (`ota-cbor-c2d`) after its session metadata, and again for every BLE session
+  and MQTT connection so the cloud resends an unfinished update; writes each command as `OTA_C2D` with
+  `NEEDS_ACK`, retransmitting on `NACK` or silence, and acknowledges it to the broker only once the device
+  has; and publishes the device's results (`OTA_D2C`) to `ota-cbor-d2c`.
+- **Artifact transfer** — the gateway answers the device's `ARTIFACT_REQUEST` (open, read, close): it
+  downloads the firmware over HTTPS with the `OtaSecret` from the request, once per artifact and shared
+  by all devices, into the app's cache directory, and serves the device's reads from it. Downloads
+  outlive the session that started them, resume after an interruption, and never log URLs or secrets.
+- `OtaConfig` (the new last parameter of `SpotflowGateway`): turn OTA off, or change the largest artifact
+  the gateway downloads (32 MiB by default).
+- `GatewayDeviceState.otaEnabled` and `otaTransfer` (an `OtaTransfer`: artifact size, bytes delivered);
+  the demo app shows them.
+- `SpotflowTopics.otaCommands` and `otaResults`.
+
+### Changed
+
+- A device that advertises OTA now gets updates through the gateway; until now its OTA messages were
+  dropped. Pass `OtaConfig(enabled = false)` to keep the old behaviour.
+- The gateway can use up to four artifacts' worth of the app's cache directory (`spotflow-ota/`) while
+  devices update; it is emptied on `shutdown()`.
+- Source compatible; the `SpotflowGateway`, `GatewayDeviceState` and `SpotflowTopics` constructors gained
+  parameters, so code built against 0.2.x has to be recompiled.
+
 ## 0.2.1
 
 Support for version 1.1 of the Spotflow BLE protocol, which comes with the current Spotflow cloud and

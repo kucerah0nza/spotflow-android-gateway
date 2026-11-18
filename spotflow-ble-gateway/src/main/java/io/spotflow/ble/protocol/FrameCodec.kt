@@ -17,8 +17,8 @@ import java.io.ByteArrayOutputStream
  * All fragments of one message share the same `type` and `seq`; `seq` increments per message (per type)
  * and is how the [Reassembler] groups fragments. Flags mark the first and last fragment. [FLAG_NEEDS_ACK]
  * (protocol 1.1) asks the receiver for an ACK/NACK control frame once the message is reassembled; the
- * gateway sets it on nothing it sends, and the Device SDK sets it on nothing it sends, but a message whose
- * fragments disagree on it is malformed. The remaining flag bits are reserved: they are ignored.
+ * gateway sets it on OTA commands ([MessageType.OTA_C2D]), the Device SDK on nothing it sends. A message
+ * whose fragments disagree on it is malformed. The remaining flag bits are reserved: they are ignored.
  */
 internal object FrameCodec {
 
@@ -43,10 +43,17 @@ internal object FrameCodec {
      * Splits [payload] of the given [type] into wire frames that each fit within [mtu].
      *
      * @param seq message sequence number (0..255), shared by every fragment of this message.
+     * @param needsAck sets [FLAG_NEEDS_ACK] in every fragment: the receiver answers with an ACK or NACK.
      * @return the ordered list of frames to write to the RX Stream characteristic. An empty payload
      *   still produces exactly one frame flagged both first and last.
      */
-    fun fragment(type: MessageType, payload: ByteArray, seq: Int, mtu: Int): List<ByteArray> {
+    fun fragment(
+        type: MessageType,
+        payload: ByteArray,
+        seq: Int,
+        mtu: Int,
+        needsAck: Boolean = false,
+    ): List<ByteArray> {
         require(payload.size <= MAX_MESSAGE_LENGTH) {
             "payload of ${payload.size} bytes exceeds max message length $MAX_MESSAGE_LENGTH"
         }
@@ -67,7 +74,7 @@ internal object FrameCodec {
             val chunk = minOf(capacity, total - offset)
             val isLast = offset + chunk >= total
 
-            var flags = 0
+            var flags = if (needsAck) FLAG_NEEDS_ACK else 0
             if (isFirst) flags = flags or FLAG_IS_FIRST
             if (isLast) flags = flags or FLAG_IS_LAST
 

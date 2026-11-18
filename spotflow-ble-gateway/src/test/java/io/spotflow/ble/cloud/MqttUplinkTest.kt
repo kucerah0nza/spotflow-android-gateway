@@ -6,7 +6,7 @@ import org.junit.Test
 
 class MqttUplinkTest {
 
-    private fun desired(topic: String) = MqttUplink.isDesiredConfigurationTopic("config-cbor-c2d", topic)
+    private fun desired(topic: String) = MqttUplink.isTopicOrBelow("config-cbor-c2d", topic)
 
     @Test
     fun `desired configuration topic matches the base and per-device topics below it`() {

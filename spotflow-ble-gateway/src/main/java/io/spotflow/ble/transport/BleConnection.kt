@@ -71,6 +71,15 @@ internal interface BleConnection {
     suspend fun sendDesiredConfiguration(payload: ByteArray)
 
     /**
+     * Writes an OTA command (OTA_C2D) and suspends until the device acknowledges it, retransmitting on a
+     * NACK or silence. Throws if the link goes down first.
+     */
+    suspend fun sendOtaCommand(payload: ByteArray)
+
+    /** Fragments and writes an ARTIFACT_RESPONSE payload to the RX Stream. */
+    suspend fun sendArtifactResponse(payload: ByteArray)
+
+    /**
      * Releases the transport. A managed connection disconnects and closes the GATT; an attached
      * connection turns the device's TX stream off, stops using the GATT and leaves the host to own
      * disconnection. Call from a non-cancellable context.
