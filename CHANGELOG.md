@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1
 
 Support for version 1.1 of the Spotflow BLE protocol, which comes with the current Spotflow cloud and
 the Device SDK's BLE OTA support. The MQTT side (broker, credentials, topics) is unchanged. OTA updates
