@@ -4,7 +4,8 @@ A reusable Android library (Kotlin, shipped as an AAR) that turns any Android ap
 gateway**: it connects to devices running the [Spotflow Device SDK](https://github.com/spotflow-io/device-sdk)
 with the BLE transport enabled and relays their diagnostics (logs, metrics, core dumps, configuration) to
 the Spotflow cloud over MQTT — **while the screen is off**, **across reconnects**, and **through network
-outages**.
+outages**. It speaks version 1.1 of the Spotflow BLE protocol; **over-the-air (OTA) updates through the
+gateway are not supported yet** (see [OTA updates](#ota-updates)).
 
 The goal is drop-in integration for hardware vendors who already ship an Android companion app (e.g. a
 smart thermostat): add the library, hand it a connection or let it scan, and their BLE devices show up in
@@ -51,13 +52,13 @@ flowchart LR
         subgraph BLE["BLE session · ends when the link drops"]
             direction TB
             S["SpotflowGattSession<br/>serialized GATT queue"]
-            F["FrameCodec<br/>reassemble fragments"]
+            F["FrameCodec<br/>reassemble fragments<br/>(OTA and ACK/NACK frames dropped)"]
             S --> F
         end
         subgraph CL["CloudLink · one per device ID, outlives BLE sessions"]
             direction TB
             B[("StoreAndForwardBuffer<br/>RAM tier → flash tier<br/>(byte-bounded, FIFO)")]
-            U["MqttUplink<br/>up to 16 publishes in flight"]
+            U["MqttUplink<br/>up to 16 publishes in flight<br/>session metadata re-sent on reconnect"]
             B --> U
         end
         F --> B
@@ -65,6 +66,7 @@ flowchart LR
 
     C["mqtt.spotflow.io:8883"]
 
+    D -- "GATT read · capabilities,<br/>device ID, session metadata" --> S
     D -- "GATT notify · framed CBOR<br/>(TX Stream 0005)" --> S
     U -- "MQTTS · QoS 1<br/>user = device ID · pass = ingest key" --> C
     C -- "desired config<br/>(config-cbor-c2d)" --> U
@@ -101,11 +103,11 @@ devices never come back.
   ignored.
 - **Protocol version** — the gateway speaks protocol 1.1 and works with 1.0 devices. Capabilities holds
   the major and minor version and, from 1.1, a feature byte whose bit 0 says the device takes OTA updates
-  through the gateway. This gateway does not relay OTA updates yet: such a device is relayed for
-  telemetry and configuration, which is all it can do through a gateway without OTA.
+  through the gateway. A device built with OTA is relayed for telemetry and configuration; its OTA is not
+  (see [OTA updates](#ota-updates)).
 - **Encryption** — a device can require an encrypted (paired) link for everything but Capabilities; the
   Device SDK does by default when built with OTA. Pair (bond) such a device with the phone, or the
-  session fails with an error saying so.
+  session fails with a `BLUETOOTH` error saying so.
 - **Message types** — `TELEMETRY` (`0x02`), `REPORTED_CONFIGURATION` (`0x03`),
   `DESIRED_CONFIGURATION` (`0x04`). Telemetry payloads carry logs, metrics **and core-dump chunks**; the
   gateway relays them opaquely (CBOR is not parsed). The OTA types of protocol 1.1 (`OTA_D2C` `0x05`,
@@ -137,6 +139,24 @@ devices never come back.
 - **Reassembly** only delivers a message whose size matches the length declared in its first fragment;
   a message with a lost fragment is dropped rather than forwarded truncated.
 
+### OTA updates
+
+Protocol 1.1 lets a device take firmware updates through its gateway. Relaying them is **not implemented
+yet**. It would take the gateway to:
+
+- subscribe to `ota-cbor-c2d` for devices whose Capabilities advertise OTA, and write what arrives down
+  the RX Stream as `OTA_C2D`, with `NEEDS_ACK`, retransmitting until the device acknowledges it;
+- publish the device's `OTA_D2C` messages (update results) to `ota-cbor-d2c`;
+- download each artifact over HTTPS on the device's behalf (URL and secret come from the update manifest)
+  and serve it in blocks, answering the device's `ARTIFACT_REQUEST` (open, read, close) with
+  `ARTIFACT_RESPONSE`.
+
+Until then, a device built with OTA works through this gateway like any other: logs, metrics, core dumps
+and configuration are relayed, and the OTA messages it sends are dropped. The gateway does not subscribe
+to `ota-cbor-c2d`, so an update deployed to such a device does not progress while this gateway relays it.
+To update it over BLE, connect it through the Spotflow Web App gateway (see the
+[BLE guide](https://docs.spotflow.io/guides/bluetooth-low-energy)).
+
 ### Package layout (`spotflow-ble-gateway/src/main/java/io/spotflow/ble`)
 
 The library is built in Kotlin's explicit-API mode: what is public is public on purpose, and
@@ -147,7 +167,7 @@ else is internal.
   `GatewayStatus` / `ScanState`, `SpotflowLog`; `cloud/` `MqttConfig` / `SpotflowTopics` / `PublishQos`,
   `CredentialsProvider` + `StaticIngestKey`, `BufferUsage`; `transport/ConnectionState`;
   `protocol/GattProfile` (the UUIDs); `service/SpotflowGatewayService`.
-- `protocol/` — `MessageType`, `Message`, `FrameCodec` (pure JVM, unit-tested).
+- `protocol/` — `MessageType`, `Message`, `FrameCodec`, `DeviceCapabilities` (pure JVM, unit-tested).
 - `transport/` — `BleConnection` (with `ManagedBleConnection` / `AttachedBleConnection`),
   `SpotflowGattSession` (serialized GATT command queue + callback bridge), `SpotflowScanner`.
 - `cloud/` — `MqttUplink` (behind the `Uplink` interface), `StoreAndForwardBuffer` (a device's two-tier
@@ -318,7 +338,7 @@ flowchart TD
     R -- "no" --> Q
     S --> Q
     Q --> C{"network up and<br/>MQTT connected?"}
-    C -- "no" --> W["wait for the network,<br/>reconnect with backoff"]
+    C -- "no" --> W["wait for the network,<br/>reconnect with backoff,<br/>re-send the session metadata in effect"]
     W --> C
     C -- "yes" --> P["publish up to 16 at once (QoS 1)"]
     P --> K{"acknowledged<br/>by the broker?"}
@@ -339,7 +359,8 @@ flowchart TD
   never again — is retried with backoff rather than leaving discovery dead until Bluetooth is toggled.
 - **Network** — the gateway watches the phone's connectivity: with no network, uploads wait for one
   instead of retrying, and they resume the moment it is back rather than at the end of a backoff. A
-  connection that drops is noticed as it happens — also during a quiet period — and re-established.
+  connection that drops is noticed as it happens — also during a quiet period — and re-established, and
+  the device's session metadata is published on it first, since the cloud applies it per connection.
 - **Store-and-forward buffer** — a two-tier buffer keeps diagnostics flowing through outages without
   wearing the flash. In steady state messages flow through a small **RAM tier only** (no disk writes);
   once the RAM tier fills (`ramBufferMaxBytes`, default 1 MiB — i.e. the network has been down a while) the
@@ -464,7 +485,8 @@ publish.
 
 1. **Unit (no hardware):**
    - `FrameCodecTest` — fragmentation/reassembly incl. the 23-byte MTU, multi-fragment messages, and
-     malformed or incomplete input.
+     malformed or incomplete input; dropping OTA frames and ACK/NACK control frames, and `NEEDS_ACK`.
+   - `DeviceCapabilitiesTest` — reading Capabilities of protocol 1.0 and 1.1 devices.
    - `MessageStoreTest`, `StoreAndForwardBufferTest` — the buffer: FIFO across tiers, the shared budget and
      fair eviction across devices, batched reads and deletes, opening lazily and falling back to RAM when
      the database is unusable, migration from per-device files, RAM-only mode.
@@ -473,7 +495,8 @@ publish.
      configuration and its acknowledgement. This is what keeps the fake uplink used elsewhere honest.
    - `GatewaySessionTest` — the orchestration against fake BLE/MQTT: offline buffering, uploading after
      disconnect, link hand-over, several messages in flight, poison messages, waiting for the network,
-     desired configuration incl. its re-send after a device reboot, recovering buffers from an earlier run.
+     desired configuration incl. its re-send after a device reboot, session metadata re-sent after an MQTT
+     reconnect, recovering buffers from an earlier run.
    - `SpotflowGatewayTest` — the gateway's own logic against a fake platform, in virtual time: scan retry
      and restart, the per-device reconnect loop, rejected keys and rejected devices, Bluetooth off/on,
      data handed over across a restart.
@@ -493,7 +516,10 @@ publish.
    - force a **core dump** — the full dump is delivered;
    - change the **minimal log severity in the portal** — with the device connected and while it is off;
      the portal leaves "Synchronizing" once the device applies it, and **Received** counts it;
-   - **restart the device** after changing the severity — the configured severity is restored.
+   - **restart the device** after changing the severity — the configured severity is restored;
+   - build the sample **with OTA** (its `ota.conf`) and `CONFIG_SPOTFLOW_BLE_REQUIRE_ENCRYPTION=y` —
+     unpaired, the session fails with an error asking for pairing; paired with the phone, it relays as
+     before.
 
 ## License
 
