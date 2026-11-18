@@ -242,21 +242,26 @@ internal class StoreAndForwardBuffer internal constructor(
     /** Whether nothing of this device is buffered. */
     val isEmpty: Boolean get() = synchronized(pool.lock) { ram.isEmpty() && flashRows() == 0L }
 
-    /** Appends a message to RAM; the pool then spills or drops as needed to stay within its budget. */
-    fun enqueue(topic: String, payload: ByteArray) {
+    /**
+     * Appends a message to RAM; the pool then spills or drops as needed to stay within its budget.
+     * Returns the message's sequence number, or null if the buffer is closed (the message is dropped).
+     */
+    fun enqueue(topic: String, payload: ByteArray): Long? {
+        val item: Item
         val changed = synchronized(pool.lock) {
             if (closed) {
                 // Its owner is gone (the cloud link was closed): nothing would ever upload this.
                 Slog.w(TAG, "dropping a message for $deviceId that arrived after its buffer was closed")
-                return
+                return null
             }
-            val item = Item(store.nextSeq(deviceId), topic, payload)
+            item = Item(store.nextSeq(deviceId), topic, payload)
             ram.addLast(item)
             ramTierBytes += cost(item)
             pool.ramChanged(cost(item))
             pool.enforceRamBudget().also { pool.publishUsage() }
         }
         notify(changed)
+        return item.seq
     }
 
     /**

@@ -1,6 +1,7 @@
 package io.spotflow.ble
 
 import io.spotflow.ble.cloud.MqttConfig
+import io.spotflow.ble.protocol.DeviceCapabilities
 import io.spotflow.ble.protocol.MessageType
 import io.spotflow.ble.transport.BleConnection
 import io.spotflow.ble.transport.ConnectionState
@@ -56,14 +57,18 @@ internal class GatewaySession(
             // first; enable the TX stream last.
             connection.prepare()
             try {
-                val version = connection.readProtocolVersion()
-                if (version != SUPPORTED_PROTOCOL_VERSION) {
-                    Slog.w(TAG, "device reports protocol version $version; this gateway speaks $SUPPORTED_PROTOCOL_VERSION")
+                val capabilities = connection.readCapabilities()
+                if (!capabilities.isCompatible) {
+                    Slog.w(TAG, "device speaks protocol $capabilities; this gateway speaks ${DeviceCapabilities.SUPPORTED_MAJOR}.x")
+                } else if (capabilities.otaSupported) {
+                    // The device then works without OTA: it updates over BLE only through a gateway that
+                    // forwards its OTA messages, which this one does not do yet.
+                    Slog.i(TAG, "device supports OTA updates (protocol $capabilities); they are not relayed by this gateway")
                 }
             } catch (c: CancellationException) {
                 throw c
             } catch (t: Throwable) {
-                Slog.w(TAG, "could not read protocol version: ${t.message}")
+                Slog.w(TAG, "could not read capabilities: ${t.message}")
             }
             val deviceId = connection.readDeviceId()
             if (deviceId.isBlank()) throw DeviceRejectedException("device reported an empty device ID")
@@ -77,7 +82,7 @@ internal class GatewaySession(
             val linkUsers = ArrayList<Job>()
             try {
                 try {
-                    link.enqueue(mqttConfig.topics.ingest, connection.readSessionMetadata())
+                    link.enqueueSessionMetadata(mqttConfig.topics.ingest, connection.readSessionMetadata())
                 } catch (c: CancellationException) {
                     throw c
                 } catch (t: Throwable) {
@@ -169,7 +174,6 @@ internal class GatewaySession(
 
     private companion object {
         const val TAG = "SpotflowGateway"
-        const val SUPPORTED_PROTOCOL_VERSION = 1
         const val RSSI_INTERVAL_MS = 5_000L
     }
 }

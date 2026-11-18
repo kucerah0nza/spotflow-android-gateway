@@ -104,6 +104,51 @@ class FrameCodecTest {
     }
 
     @Test
+    fun `types the reassembler does not accept are dropped from their first fragment`() {
+        val reassembler = FrameCodec.Reassembler { it.isRelayed }
+        val ota = FrameCodec.fragment(MessageType.OTA_D2C, Random(5).nextBytes(60), seq = 1, mtu = 30)
+        val artifact = FrameCodec.fragment(MessageType.ARTIFACT_REQUEST, Random(6).nextBytes(20), seq = 1, mtu = 30)
+        (ota + artifact).forEach { assertNull(reassembler.onFragment(it)) }
+
+        val payload = Random(7).nextBytes(60)
+        val telemetry = FrameCodec.fragment(MessageType.TELEMETRY, payload, seq = 1, mtu = 30)
+        val out = telemetry.map { reassembler.onFragment(it) }.last()
+        assertArrayEquals(payload, out?.payload)
+    }
+
+    @Test
+    fun `ACK and NACK control frames are ignored`() {
+        val reassembler = FrameCodec.Reassembler()
+        // type, acknowledged type (OTA_C2D), acknowledged seq: byte 1 must not be taken for flags.
+        assertNull(reassembler.onFragment(byteArrayOf(0x00, 0x06, 0x03)))
+        assertNull(reassembler.onFragment(byteArrayOf(0x01, 0x06, 0x03)))
+        assertNull(reassembler.onFragment(byteArrayOf(0x00, 0x03, 0x03, 0x01, 0x00, 0x2A)))
+    }
+
+    @Test
+    fun `a message whose fragments disagree on NEEDS_ACK is dropped`() {
+        val reassembler = FrameCodec.Reassembler()
+        val t = MessageType.TELEMETRY.value.toByte()
+        val first = (FrameCodec.FLAG_IS_FIRST or FrameCodec.FLAG_NEEDS_ACK).toByte()
+        assertNull(reassembler.onFragment(byteArrayOf(t, first, 4, 4, 0, 1, 2)))
+        assertNull(reassembler.onFragment(byteArrayOf(t, FrameCodec.FLAG_IS_LAST.toByte(), 4, 3, 4)))
+    }
+
+    @Test
+    fun `NEEDS_ACK set consistently and reserved flag bits do not affect reassembly`() {
+        val reassembler = FrameCodec.Reassembler()
+        val t = MessageType.TELEMETRY.value.toByte()
+        val reserved = 0xF8
+        val first = (FrameCodec.FLAG_IS_FIRST or FrameCodec.FLAG_NEEDS_ACK or reserved).toByte()
+        val last = (FrameCodec.FLAG_IS_LAST or FrameCodec.FLAG_NEEDS_ACK).toByte()
+        assertNull(reassembler.onFragment(byteArrayOf(t, first, 4, 4, 0, 1, 2)))
+        assertEquals(
+            Message(MessageType.TELEMETRY, byteArrayOf(1, 2, 3, 4)),
+            reassembler.onFragment(byteArrayOf(t, last, 4, 3, 4)),
+        )
+    }
+
+    @Test
     fun `too short frame is dropped`() {
         val reassembler = FrameCodec.Reassembler()
         assertNull(reassembler.onFragment(byteArrayOf(0x02, 0x01)))

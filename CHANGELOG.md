@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+Support for version 1.1 of the Spotflow BLE protocol, which comes with the current Spotflow cloud and
+the Device SDK's BLE OTA support. The MQTT side (broker, credentials, topics) is unchanged. OTA updates
+through the gateway are not relayed yet.
+
+### Added
+
+- **Protocol 1.1** — the Capabilities characteristic is read as major and minor version plus the feature
+  byte (bit 0: OTA supported); 1.0 devices, which expose only the version, keep working. A device built
+  with OTA is relayed for telemetry and configuration, and the log says that its OTA is not relayed.
+- The new message types (`OTA_D2C`, `OTA_C2D`, `ARTIFACT_REQUEST`, `ARTIFACT_RESPONSE`) and the
+  `ACK`/`NACK` control frames are recognized and dropped on arrival, instead of being reassembled (taking
+  up to 64 KiB each and competing with telemetry for the in-flight slots) and dropped at the end.
+
+### Fixed
+
+- **Session metadata** is published again after an MQTT reconnect, ahead of everything else: the cloud
+  applies it per connection, so telemetry sent after a reconnect lost its context (build ID, run ID).
+- A message whose fragments disagree on `NEEDS_ACK` is dropped as malformed, as protocol 1.1 requires.
+- A device that requires an encrypted link (the Device SDK's default when built with OTA) fails with an
+  error saying it must be paired, not with a bare GATT status.
+
 ## 0.2.0
 
 A hardening release. The library's public API changed in a few places; see
