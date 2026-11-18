@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 Over-the-air firmware updates through the gateway (Spotflow BLE protocol 1.1).
 
