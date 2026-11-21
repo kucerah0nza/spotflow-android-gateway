@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Apps on Kotlin 2.1 or newer can use the library.** It was compiled with the latest language version,
+  so its metadata (2.3) could be read only by Kotlin 2.2 or newer, and apps on an older Kotlin failed to
+  compile ("Module was compiled with an incompatible version of Kotlin"). It is now built with language
+  and API version 2.1, and its POM asks for `kotlin-stdlib` 2.1.21 rather than 2.3.21. Kotlin 2.1 is
+  the minimum because kotlinx-coroutines 1.11 is built with Kotlin 2.2.
+
 ## 0.3.0
 
 Over-the-air firmware updates through the gateway (Spotflow BLE protocol 1.1).
