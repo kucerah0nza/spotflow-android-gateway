@@ -218,6 +218,8 @@ else is internal.
 
 ## Adding the library
 
+The library needs an app on **Kotlin 2.1 or newer**, with `minSdk` 26 and `compileSdk` 35 or newer.
+
 The library is not on Maven Central yet. Each release attaches
 `spotflow-ble-gateway-<tag>-maven.zip`: a Maven repository holding the AAR **and its POM**, so Gradle
 resolves the library's own dependencies (the MQTT client, coroutines, AndroidX core). Unzip it into your

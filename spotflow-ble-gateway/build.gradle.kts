@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.dsl.KotlinVersion
 
 plugins {
     alias(libs.plugins.android.library)
@@ -49,8 +50,17 @@ android {
 kotlin {
     // Everything public is public on purpose: a declaration without a visibility modifier doesn't compile.
     explicitApi()
+    // Host apps on Kotlin 2.1 or newer can use the library. A compiler reads metadata at most one
+    // version ahead of its own, and the metadata version follows the language version, so building with
+    // the latest language version would force every host onto the same Kotlin. The API version keeps the
+    // library off standard-library APIs newer than 2.1, and the published POM asks for that stdlib.
+    // The floor is 2.1, not lower, because of kotlinx-coroutines: 1.11 is built with Kotlin 2.2, which a
+    // 2.0 compiler cannot read. Raise these together with any dependency built with a newer Kotlin.
+    coreLibrariesVersion = "2.1.21"
     compilerOptions {
         jvmTarget.set(JvmTarget.JVM_17)
+        languageVersion.set(KotlinVersion.KOTLIN_2_1)
+        apiVersion.set(KotlinVersion.KOTLIN_2_1)
     }
 }
 
