@@ -12,7 +12,7 @@ lifecycle = "2.11.0"
 hivemqMqtt = "1.4.2"
 junit = "4.13.2"
 mockk = "1.14.12"
-robolectric = "4.18"
+robolectric = "4.18.1"
 androidxTestCore = "1.7.0"
 binaryCompatibilityValidator = "0.18.2"
 
